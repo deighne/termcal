@@ -53,7 +53,13 @@ caldir sync
 
 ### 2. Install TermCal
 
-Using [pipx](https://pypa.github.io/pipx/):
+Using [Homebrew](https://brew.sh):
+
+```bash
+brew install deighne/tap/termcal
+```
+
+Or using [pipx](https://pypa.github.io/pipx/):
 
 ```bash
 pipx install git+https://github.com/deighne/termcal.git
