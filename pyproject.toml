@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "termcal"
+dynamic = ["version"]
+description = "Keyboard-driven terminal calendar built on caldir"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Dane Dickerson" }]
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+  "Environment :: Console :: Curses",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Office/Business :: Scheduling",
+]
+
+[project.urls]
+Homepage = "https://github.com/deighne/termcal"
+Issues = "https://github.com/deighne/termcal/issues"
+
+[project.scripts]
+termcal = "termcal:main"
+
+[tool.setuptools]
+py-modules = ["termcal"]
+
+[tool.setuptools.dynamic]
+version = { attr = "termcal.__version__" }
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes: unused imports/vars, undefined names
+    "I",        # import sorting
+    "B",        # bugbear: likely bugs
+    "UP",       # modern syntax for the target Python
+    "SIM",      # simplifications
+    "C4",       # comprehensions
+    "RUF",      # ruff-specific checks
+    "N",        # naming
+    "PLE", "PLW",  # pylint errors/warnings
+]
+ignore = [
+    "PLW0603",  # module-level globals are fine in a single-file TUI
+]

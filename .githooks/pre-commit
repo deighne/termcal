@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Block commits that fail lint or formatting. Fix with: make fix
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+if ! command -v ruff >/dev/null; then
+    echo "pre-commit: ruff not found (brew install ruff); skipping lint" >&2
+    exit 0
+fi
+ruff check --quiet || { echo "pre-commit: lint failed; run 'make fix' or fix by hand" >&2; exit 1; }
+ruff format --check --quiet || { echo "pre-commit: formatting off; run 'make fix'" >&2; exit 1; }
+python3 -m unittest -q || { echo "pre-commit: tests failed; run 'make test'" >&2; exit 1; }
