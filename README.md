@@ -92,7 +92,7 @@ termcal --check
 | `c` | Toggle full calendar month view (`Enter` opens the focused day) |
 | `i` | Toggle pending invites view |
 | `Enter` / `o` | Open meeting link (Zoom, Google Meet, Teams, Webex) |
-| `g` | Open event in Google Calendar (e.g. for Propose New Time) |
+| `g` | Open event in external calendar (Google Calendar web, Outlook web, or default desktop calendar) |
 | `a` `d` `m` | RSVP accept / decline / maybe (`caldir rsvp`) |
 | `n` | New event modal: title, when, duration, location, notes, calendar |
 | `e` | Edit event modal: title, when, duration, location, notes (this event vs. entire series) |

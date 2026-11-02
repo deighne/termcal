@@ -446,18 +446,43 @@ def my_status(event: dict, my_emails: set[str]) -> str | None:
     return None
 
 
-def google_remote(calendar_dir: Path, slug: str) -> dict[str, str]:
-    """google_calendar_id / google_account from a calendar's .caldir/config.toml."""
+def read_calendar_remote(calendar_dir: Path, slug: str) -> dict[str, str]:
+    """Read provider, accounts, and URLs from a calendar's .caldir/config.toml."""
     remote: dict[str, str] = {}
     try:
-        text = (calendar_dir / slug / ".caldir" / "config.toml").read_text()
+        text = (calendar_dir / slug / ".caldir" / "config.toml").read_text(errors="replace")
     except OSError:
         return remote
-    for key in ("provider", "google_calendar_id", "google_account"):
-        m = re.search(rf'^{key}\s*=\s*"([^"]*)"', text, re.MULTILINE)
-        if m:
-            remote[key] = m.group(1)
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if "=" not in line or line.startswith("#"):
+            continue
+        key, val = [p.strip() for p in line.split("=", 1)]
+        val = val.strip("\"'")
+        remote[key] = val
     return remote
+
+
+google_remote = read_calendar_remote
+
+
+def open_local_file(path: Path) -> bool:
+    """Open a file with the system default desktop application."""
+    if not path or not path.exists():
+        return False
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        if sys.platform.startswith("linux"):
+            subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        if sys.platform == "win32":
+            os.startfile(str(path))
+            return True
+    except OSError:
+        pass
+    return False
 
 
 def google_event_url(event: dict, remote: dict[str, str]) -> str | None:
@@ -1053,18 +1078,56 @@ def dispatch_open(state: AppState) -> None:
     log_append(state, f"opened {url[:60]}")
 
 
-def dispatch_google(state: AppState) -> None:
-    """Open the event in Google Calendar, e.g. to use Propose new time."""
+def dispatch_calendar(state: AppState) -> None:
+    """Open event in external calendar (Google, Outlook, iCloud, or default system calendar)."""
     event = state.selected()
     if not event:
         return
-    remote = google_remote(state.calendar_dir, event["calendar"])
-    url = google_event_url(event, remote) if remote.get("provider") == "google" else None
-    if not url:
-        log_append(state, "no Google Calendar link for this event")
+    remote = read_calendar_remote(state.calendar_dir, event["calendar"])
+    provider = remote.get("provider", "").lower()
+
+    if provider == "google":
+        url = google_event_url(event, remote)
+        if url:
+            webbrowser.open(url)
+            log_append(state, "opened in Google Calendar")
+            return
+
+    if provider == "outlook":
+        day_iso = event_day(event).isoformat()
+        acct = (remote.get("microsoft_account") or "").lower()
+        is_live = any(d in acct for d in ("outlook.", "hotmail.", "live.", "msn."))
+        domain = "outlook.live.com" if is_live else "outlook.office.com"
+        url = f"https://{domain}/calendar/view/day?startdt={day_iso}"
+        webbrowser.open(url)
+        log_append(state, "opened in Outlook Calendar")
         return
-    webbrowser.open(url)
-    log_append(state, "opened in Google Calendar")
+
+    if provider == "icloud":
+        path = resolve_path(state, event)
+        if path and open_local_file(path):
+            log_append(state, f"opened {event.get('summary') or 'event'} in Apple Calendar")
+            return
+        webbrowser.open("https://www.icloud.com/calendar/")
+        log_append(state, "opened in iCloud Calendar")
+        return
+
+    cal_url = remote.get("url") or ""
+    if "fastmail.com" in cal_url:
+        webbrowser.open("https://app.fastmail.com/calendar/")
+        log_append(state, "opened in Fastmail Calendar")
+        return
+
+    # Fallback for CalDAV, local, or any calendar: open .ics file with desktop calendar app
+    path = resolve_path(state, event)
+    if path and open_local_file(path):
+        log_append(state, f"opened {event.get('summary') or 'event'} in default calendar")
+        return
+
+    log_append(state, "no external calendar link or application for this event")
+
+
+dispatch_google = dispatch_calendar
 
 
 def dispatch_edit(state: AppState) -> None:
@@ -1259,38 +1322,29 @@ def dispatch_new(state: AppState) -> None:
 def get_calendar_info(calendar_dir: Path, cal: dict) -> dict:
     """Read provider, account, and configuration details for one calendar."""
     slug = cal["slug"]
-    conf_path = calendar_dir / slug / ".caldir" / "config.toml"
-    info = {
+    remote = read_calendar_remote(calendar_dir, slug)
+    account = (
+        remote.get("google_account")
+        or remote.get("apple_id")
+        or remote.get("microsoft_account")
+        or remote.get("username")
+        or remote.get("user")
+        or ""
+    )
+    if not account and remote.get("url"):
+        m = re.search(r"https?://([^/@:]+)", remote["url"])
+        if m:
+            account = m.group(1)
+
+    return {
         "slug": slug,
         "name": cal.get("name") or slug,
         "color": cal.get("color") or "",
         "read_only": bool(cal.get("read_only")),
-        "provider": "local",
-        "account": "",
+        "provider": remote.get("provider", "local"),
+        "account": account,
         "path": str(calendar_dir / slug),
     }
-    try:
-        text = conf_path.read_text(errors="replace")
-    except OSError:
-        return info
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if "=" not in line or line.startswith("#"):
-            continue
-        key, val = [p.strip() for p in line.split("=", 1)]
-        val = val.strip("\"'")
-        if key == "provider":
-            info["provider"] = val
-        elif key in ("google_account", "apple_id", "microsoft_account", "username", "user"):
-            if not info["account"]:
-                info["account"] = val
-        elif key == "url" and not info["account"]:
-            m = re.search(r"https?://([^/@:]+)", val)
-            if m:
-                info["account"] = m.group(1)
-
-    return info
 
 
 def dispatch_accounts(state: AppState) -> None:
@@ -1973,7 +2027,24 @@ def draw(stdscr, state: AppState) -> None:
         addstr(stdscr, h - 1, 0, line, curses.A_REVERSE | curses.A_BOLD)
         addstr(stdscr, h - 1, max(0, w - 22), "Enter ok · Esc cancel", curses.A_REVERSE)
     else:
-        addstr(stdscr, h - 1, 0, f" {FOOTER[1]}".ljust(w), curses.A_REVERSE)
+        sel_ev = state.selected()
+        ext_label = "G Google"
+        if sel_ev:
+            remote = read_calendar_remote(state.calendar_dir, sel_ev["calendar"])
+            prov = remote.get("provider", "").lower()
+            if prov == "google":
+                ext_label = "G Google"
+            elif prov == "outlook":
+                ext_label = "G Outlook"
+            elif prov == "icloud":
+                ext_label = "G iCloud"
+            else:
+                ext_label = "G Calendar"
+        footer_line2 = (
+            f" O Join | {ext_label} | A Accept | D Decline | M Maybe | N New"
+            " | E Edit | X Delete | S Sync | U Auto-sync"
+        )
+        addstr(stdscr, h - 1, 0, footer_line2.ljust(w), curses.A_REVERSE)
 
     if state.modal:
         if state.modal.get("type") == "accounts":

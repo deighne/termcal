@@ -707,6 +707,128 @@ class AccountsModalTests(unittest.TestCase):
         self.assertIn("caldir connect", rendered)  # Connect command hint
 
 
+class DispatchCalendarTests(unittest.TestCase):
+    def test_dispatch_google(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "work" / ".caldir").mkdir(parents=True)
+            (tmp_path / "work" / ".caldir" / "config.toml").write_text(
+                'provider = "google"\ngoogle_account = "user@gmail.com"\ngoogle_calendar_id = "c_123"\n'
+            )
+            with patch.object(tc, "read_config", return_value={}):
+                state = tc.AppState()
+            state.focus_day = date(2026, 10, 20)
+            state.calendar_dir = tmp_path
+            state.events = [
+                {
+                    "instance_id": "e1",
+                    "uid": "u1",
+                    "summary": "Meeting",
+                    "start": "2026-10-20T10:00:00-06:00",
+                    "end": "2026-10-20T11:00:00-06:00",
+                    "all_day": False,
+                    "calendar": "work",
+                    "x_properties": [{"name": "X-GOOGLE-EVENT-ID", "value": "eid_123"}],
+                }
+            ]
+            tc.rebuild_rows(state)
+
+            with patch("webbrowser.open") as mock_open:
+                tc.dispatch_calendar(state)
+                mock_open.assert_called_once()
+                self.assertIn("calendar.google.com", mock_open.call_args[0][0])
+                self.assertIn("eid=", mock_open.call_args[0][0])
+
+    def test_dispatch_outlook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "work" / ".caldir").mkdir(parents=True)
+            (tmp_path / "work" / ".caldir" / "config.toml").write_text(
+                'provider = "outlook"\nmicrosoft_account = "corp@company.com"\n'
+            )
+            with patch.object(tc, "read_config", return_value={}):
+                state = tc.AppState()
+            state.focus_day = date(2026, 10, 20)
+            state.calendar_dir = tmp_path
+            state.events = [
+                {
+                    "instance_id": "e1",
+                    "uid": "u1",
+                    "summary": "Sync",
+                    "start": "2026-10-20T10:00:00-06:00",
+                    "end": "2026-10-20T11:00:00-06:00",
+                    "all_day": False,
+                    "calendar": "work",
+                }
+            ]
+            tc.rebuild_rows(state)
+
+            with patch("webbrowser.open") as mock_open:
+                tc.dispatch_calendar(state)
+                mock_open.assert_called_once()
+                self.assertIn("outlook.office.com", mock_open.call_args[0][0])
+
+    def test_dispatch_icloud_and_local_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "work" / ".caldir").mkdir(parents=True)
+            (tmp_path / "work" / ".caldir" / "config.toml").write_text(
+                'provider = "icloud"\napple_id = "user@icloud.com"\n'
+            )
+            ics_file = tmp_path / "work" / "event.ics"
+            ics_file.write_text("BEGIN:VCALENDAR\nEND:VCALENDAR\n")
+
+            with patch.object(tc, "read_config", return_value={}):
+                state = tc.AppState()
+            state.focus_day = date(2026, 10, 20)
+            state.calendar_dir = tmp_path
+            state.events = [
+                {
+                    "instance_id": "e1",
+                    "uid": "u1",
+                    "summary": "Doctor",
+                    "start": "2026-10-20T10:00:00-06:00",
+                    "end": "2026-10-20T11:00:00-06:00",
+                    "all_day": False,
+                    "calendar": "work",
+                    "path": str(ics_file),
+                }
+            ]
+            tc.rebuild_rows(state)
+
+            with patch.object(tc, "open_local_file", return_value=True) as mock_open_local:
+                tc.dispatch_calendar(state)
+                mock_open_local.assert_called_once_with(ics_file)
+
+    def test_dynamic_footer_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "work" / ".caldir").mkdir(parents=True)
+            (tmp_path / "work" / ".caldir" / "config.toml").write_text('provider = "outlook"\n')
+
+            with patch.object(tc, "read_config", return_value={}):
+                state = tc.AppState()
+            state.focus_day = date(2026, 10, 20)
+            state.calendar_dir = tmp_path
+            state.calendars = [{"slug": "work", "name": "Work", "color": "#0000ff", "read_only": False}]
+            state.events = [
+                {
+                    "instance_id": "e1",
+                    "uid": "u1",
+                    "summary": "Outlook Event",
+                    "start": "2026-10-20T10:00:00-06:00",
+                    "end": "2026-10-20T11:00:00-06:00",
+                    "all_day": False,
+                    "calendar": "work",
+                }
+            ]
+            tc.rebuild_rows(state)
+            scr = FakeScreen([], h=30, w=120)
+            tc.draw(scr, state)
+            rendered = scr.rendered_text()
+            self.assertIn("G Outlook", rendered)
+
+
 class CliArgTests(unittest.TestCase):
     def test_version_flag(self) -> None:
         with self.assertRaises(SystemExit) as ctx, patch("sys.stdout", new_callable=io.StringIO) as out:
