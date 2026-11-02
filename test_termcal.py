@@ -338,6 +338,289 @@ class CaldirCheckTests(unittest.TestCase):
             self.assertIn("OK with 1 calendar(s)", msg)
 
 
+class TimelineTests(unittest.TestCase):
+    def make_state(self, focus_day: date | None = None) -> tc.AppState:
+        with patch.object(tc, "read_config", return_value={"default_calendar": "work"}):
+            state = tc.AppState()
+        state.calendars = [
+            {"slug": "work", "name": "Work", "color": "#0000ff", "read_only": False},
+        ]
+        state.focus_day = focus_day or date(2026, 10, 20)
+        state.view = "day"
+        state.day_timeline = True
+        return state
+
+    def test_toggle_timeline(self) -> None:
+        state = self.make_state()
+        state.day_timeline = False
+        with patch.object(tc, "save_prefs") as mock_save:
+            tc.toggle_day_timeline(state)
+            self.assertTrue(state.day_timeline)
+            mock_save.assert_called_with({"day_timeline": True})
+
+            tc.toggle_day_timeline(state)
+            self.assertFalse(state.day_timeline)
+            mock_save.assert_called_with({"day_timeline": False})
+
+        # When toggling from week view, should switch to day view with timeline enabled
+        state.view = "week"
+        state.day_timeline = False
+        with patch.object(tc, "save_prefs"):
+            tc.toggle_day_timeline(state)
+            self.assertEqual(state.view, "day")
+            self.assertTrue(state.day_timeline)
+
+    def test_v_key_handles_toggle(self) -> None:
+        state = self.make_state()
+        state.day_timeline = False
+        with patch.object(tc, "save_prefs"):
+            tc.handle_normal_input(state, ord("v"))
+            self.assertTrue(state.day_timeline)
+            tc.handle_normal_input(state, ord("v"))
+            self.assertFalse(state.day_timeline)
+
+    def test_duration_and_gap_helpers(self) -> None:
+        self.assertEqual(tc.event_row_count(30), 1)
+        self.assertEqual(tc.event_row_count(60), 2)
+        self.assertEqual(tc.event_row_count(120), 3)
+
+        self.assertEqual(tc.fmt_duration_badge(30), " (30m)")
+        self.assertEqual(tc.fmt_duration_badge(60), " (1h)")
+        self.assertEqual(tc.fmt_duration_badge(90), " (1h 30m)")
+
+        gap = tc.fmt_gap_bar(datetime(2026, 11, 2, 10, 30), datetime(2026, 11, 2, 13, 0), 150, True)
+        self.assertIn("10:30 - 13:00", gap)
+        self.assertIn("2h 30m free", gap)
+
+    def test_timeline_empty_day(self) -> None:
+        state = self.make_state()
+        state.events = []
+        tc.rebuild_rows(state)
+
+        kinds = [r["kind"] for r in state.rows]
+        self.assertIn("header", kinds)
+        self.assertIn("empty", kinds)
+        self.assertIn("timeline", state.rows[0]["text"])
+        self.assertEqual(state.rows[1]["text"], "Nothing scheduled")
+
+    def test_timeline_all_day_only(self) -> None:
+        state = self.make_state()
+        state.events = [
+            {
+                "instance_id": "h1",
+                "uid": "h1",
+                "summary": "Holiday",
+                "start": "2026-10-20",
+                "end": "2026-10-21",
+                "all_day": True,
+                "calendar": "work",
+            }
+        ]
+        tc.rebuild_rows(state)
+
+        event_rows = [r for r in state.rows if r["kind"] == "event"]
+        self.assertEqual(len(event_rows), 1)
+        self.assertEqual(event_rows[0]["event"]["summary"], "Holiday")
+        empty_rows = [r for r in state.rows if r["kind"] == "empty"]
+        self.assertEqual(empty_rows[0]["text"], "No timed events")
+
+    def test_timeline_events_and_gap_condensation(self) -> None:
+        state = self.make_state()
+        state.events = [
+            {
+                "instance_id": "e1",
+                "uid": "e1",
+                "summary": "Morning Standup",
+                "start": "2026-10-20T09:00:00-06:00",
+                "end": "2026-10-20T10:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+                "location": "Room 101",
+            },
+            {
+                "instance_id": "e2",
+                "uid": "e2",
+                "summary": "Afternoon 1:1",
+                "start": "2026-10-20T13:00:00-06:00",
+                "end": "2026-10-20T13:30:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+        ]
+        tc.rebuild_rows(state)
+
+        # Standup starts at 09:00, 1h -> main event row + 1 continuation row
+        # Gap 10:00-13:00 (3h free)
+        # 1:1 starts at 13:00, 30m -> 1 row
+        kinds = [r["kind"] for r in state.rows]
+        self.assertEqual(kinds[0], "header")
+        self.assertEqual(kinds[1], "event")
+        self.assertEqual(state.rows[1]["event"]["summary"], "Morning Standup")
+        self.assertEqual(state.rows[1]["dur_min"], 60)
+
+        # Continuation row for 1h meeting
+        self.assertEqual(kinds[2], "event_cont")
+        self.assertIn("Room 101", state.rows[2]["text"])
+
+        # Gap row
+        self.assertEqual(kinds[3], "gap")
+        e1_end = tc.parse_when(state.events[0]["end"])
+        e2_start = tc.parse_when(state.events[1]["start"])
+        expected_range = f"{tc.fmt_time(e1_end, state.hour24)} - {tc.fmt_time(e2_start, state.hour24)}"
+        self.assertIn(expected_range, state.rows[3]["text"])
+        self.assertIn("3h free", state.rows[3]["text"])
+
+        # Afternoon meeting
+        self.assertEqual(kinds[4], "event")
+        self.assertEqual(state.rows[4]["event"]["summary"], "Afternoon 1:1")
+
+    def test_timeline_overlapping_events_and_columns(self) -> None:
+        state = self.make_state()
+        state.events = [
+            {
+                "instance_id": "e1",
+                "uid": "e1",
+                "summary": "Big Presentation",
+                "start": "2026-10-20T10:00:00-06:00",
+                "end": "2026-10-20T11:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+            {
+                "instance_id": "e2",
+                "uid": "e2",
+                "summary": "Side Sync",
+                "start": "2026-10-20T10:30:00-06:00",
+                "end": "2026-10-20T11:30:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+        ]
+        tc.rebuild_rows(state)
+
+        event_rows = [r for r in state.rows if r["kind"] == "event"]
+        self.assertEqual(len(event_rows), 2)
+        # e1 has col 0 and conflict True
+        self.assertEqual(event_rows[0]["col"], 0)
+        self.assertTrue(event_rows[0]["conflict"])
+        # e2 has col 1 and conflict True
+        self.assertEqual(event_rows[1]["col"], 1)
+        self.assertTrue(event_rows[1]["conflict"])
+
+        # No gap between them because intervals overlap (10:00 - 11:30 is contiguous)
+        gaps = [r for r in state.rows if r["kind"] == "gap"]
+        self.assertEqual(len(gaps), 0)
+
+    def test_cursor_navigation_skips_gaps_and_continuations(self) -> None:
+        state = self.make_state()
+        state.events = [
+            {
+                "instance_id": "e1",
+                "uid": "e1",
+                "summary": "Event 1",
+                "start": "2026-10-20T09:00:00-06:00",
+                "end": "2026-10-20T10:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+            {
+                "instance_id": "e2",
+                "uid": "e2",
+                "summary": "Event 2",
+                "start": "2026-10-20T14:00:00-06:00",
+                "end": "2026-10-20T14:30:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+        ]
+        tc.rebuild_rows(state)
+        # First event is at index 1
+        self.assertEqual(state.selected()["summary"], "Event 1")
+
+        # Move down: should skip cont row (idx 2) and gap row (idx 3) and land on Event 2 (idx 4)
+        tc.move_cursor(state, 1)
+        self.assertEqual(state.selected()["summary"], "Event 2")
+
+        # Move up: returns directly to Event 1
+        tc.move_cursor(state, -1)
+        self.assertEqual(state.selected()["summary"], "Event 1")
+
+    def test_timeline_now_marker_today(self) -> None:
+        today = date.today()
+        state = self.make_state(focus_day=today)
+        state.events = [
+            {
+                "instance_id": "e1",
+                "uid": "e1",
+                "summary": "Morning Meeting",
+                "start": f"{today.isoformat()}T08:00:00-06:00",
+                "end": f"{today.isoformat()}T09:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+            {
+                "instance_id": "e2",
+                "uid": "e2",
+                "summary": "Evening Wrapup",
+                "start": f"{today.isoformat()}T19:00:00-06:00",
+                "end": f"{today.isoformat()}T19:30:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+        ]
+        tc.rebuild_rows(state)
+        kinds = [r["kind"] for r in state.rows]
+        self.assertIn("now", kinds)
+
+    def test_render_timeline_screen(self) -> None:
+        state = self.make_state()
+        state.events = [
+            {
+                "instance_id": "e1",
+                "uid": "e1",
+                "summary": "Sprint Planning",
+                "start": "2026-10-20T09:00:00-06:00",
+                "end": "2026-10-20T10:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+                "location": "Boardroom",
+            },
+            {
+                "instance_id": "e2",
+                "uid": "e2",
+                "summary": "Quick Sync",
+                "start": "2026-10-20T09:30:00-06:00",
+                "end": "2026-10-20T10:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+            {
+                "instance_id": "e3",
+                "uid": "e3",
+                "summary": "Project Demo",
+                "start": "2026-10-20T14:00:00-06:00",
+                "end": "2026-10-20T15:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+        ]
+        tc.rebuild_rows(state)
+        scr = FakeScreen([], h=30, w=120)
+        tc.draw(scr, state)
+        rendered = scr.rendered_text()
+
+        # Check key timeline visual elements
+        self.assertIn("timeline", rendered)
+        self.assertIn("Sprint Planning", rendered)
+        self.assertIn("(1h)", rendered)
+        self.assertIn("Quick Sync", rendered)
+        self.assertIn("↳", rendered)  # Overlap branch
+        self.assertIn("⚡", rendered)  # Conflict icon
+        self.assertIn("Boardroom", rendered)  # Continuation line
+        self.assertIn("4h free", rendered)  # Condensed gap divider
+        self.assertIn("V Timeline", rendered)  # Footer key guide
+
+
 class CliArgTests(unittest.TestCase):
     def test_version_flag(self) -> None:
         with self.assertRaises(SystemExit) as ctx, patch("sys.stdout", new_callable=io.StringIO) as out:

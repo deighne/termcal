@@ -22,7 +22,7 @@ caldir owns the data (a local directory of `.ics` files synced to Google Calenda
   ⧉  https://meet.google.com/...
   from Alex Rivera
  10:12:03 sync complete
- ←→ Day | [ ] Week | T Today | W Week view | C Month | I Invites | 1-9 Calendars | R Reload | Q Quit
+ ←→ Day | [ ] Week | T Today | W Week | C Month | I Invites | V Timeline | 1-9 Cals | R Reload | Q Quit
  O Join | G Google | A Accept | D Decline | M Maybe | N New | E Edit | X Delete | S Sync | U Auto-sync
 ```
 
@@ -88,6 +88,7 @@ termcal --check
 | `[` `]` | Previous / next week (or previous / next month in month view) |
 | `t` | Jump to today |
 | `w` | Toggle day / week view |
+| `v` | Toggle visual timeline in day view (proportional blocks, condensed free time, overlap conflicts) |
 | `c` | Toggle full calendar month view (`Enter` opens the focused day) |
 | `i` | Toggle pending invites view |
 | `Enter` / `o` | Open meeting link (Zoom, Google Meet, Teams, Webex) |

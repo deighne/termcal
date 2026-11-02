@@ -536,6 +536,7 @@ class AppState:
         self.path_index: dict[str, list[tuple[Path, str | None]]] = {}
         self.focus_day = date.today()
         self.view = "day"  # day | week | month | invites
+        self.day_timeline = load_prefs().get("day_timeline", self.config.get("day_timeline", False))
         self.cursor = 0
         self.rows: list[dict] = []
         self.log: list[str] = []
@@ -737,8 +738,194 @@ def toggle_auto_sync(state: AppState) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Row model
+# Row model & timeline
 # ---------------------------------------------------------------------------
+
+
+def event_row_count(duration_minutes: int) -> int:
+    """Proportional row count: <=35m -> 1 row, 36-80m -> 2 rows, >80m -> 3 rows."""
+    if duration_minutes <= 35:
+        return 1
+    if duration_minutes <= 80:
+        return 2
+    return 3
+
+
+def fmt_duration_badge(minutes: int) -> str:
+    if minutes <= 0:
+        return ""
+    if minutes >= 60:
+        h = minutes // 60
+        m = minutes % 60
+        return f" ({h}h {m}m)" if m else f" ({h}h)"
+    return f" ({minutes}m)"
+
+
+def fmt_gap_bar(start: datetime, end: datetime, minutes: int, hour24: bool) -> str:
+    if minutes >= 60:
+        h = minutes // 60
+        m = minutes % 60
+        dur_str = f"{h}h {m}m" if m else f"{h}h"
+    else:
+        dur_str = f"{minutes}m"
+    return f"┄┄ {fmt_time(start, hour24)} - {fmt_time(end, hour24)} ({dur_str} free) ┄┄"
+
+
+def event_continuation_lines(e: dict, duration_minutes: int) -> list[str]:
+    count = event_row_count(duration_minutes)
+    if count <= 1:
+        return []
+
+    loc = (e.get("location") or "").strip()
+    url = meeting_url(e)
+    attendees = e.get("attendees") or []
+    going = sum(1 for a in attendees if a.get("status") == "accepted")
+    desc = (e.get("description") or "").strip().splitlines()
+    desc_clean = [line.strip() for line in desc if line.strip()]
+
+    candidates: list[str] = []
+    if loc:
+        candidates.append(f"📍 {loc[:50]}")
+    if url and url != loc:
+        candidates.append(f"⧉  {url[:50]}")
+    if attendees:
+        att_str = f"{len(attendees)} invited, {going} accepted" if going else f"{len(attendees)} invited"
+        candidates.append(att_str)
+    if desc_clean and len(candidates) < count - 1:
+        candidates.append(desc_clean[0][:50])
+
+    lines: list[str] = []
+    for i in range(count - 1):
+        lines.append(candidates[i] if i < len(candidates) else "")
+    return lines
+
+
+def event_dot_x(state: AppState, col_idx: int) -> int:
+    time_w = 16 if not state.hour24 else 12
+    base_x = 3 + time_w + 2
+    return base_x + min(col_idx * 4, 16)
+
+
+def build_day_timeline(state: AppState, rows: list[dict], visible: list[dict]) -> None:
+    """Build visual day timeline: earliest to latest event, condensed gaps, overlap indentation."""
+    day = state.focus_day
+    todays = [e for e in visible if event_day(e) == day]
+    all_day_events = sorted((e for e in todays if e["all_day"]), key=lambda e: e.get("summary") or "")
+    timed_events = sorted(
+        (e for e in todays if not e["all_day"]),
+        key=lambda e: (parse_when(e["start"]), parse_when(e["end"])),
+    )
+
+    label = day.strftime("%A, %b %-d") + ("  · today" if day == date.today() else "") + "  · timeline"
+    rows.append({"kind": "header", "text": label})
+
+    for e in all_day_events:
+        rows.append({"kind": "event", "event": e, "timeline": True, "all_day": True})
+
+    if not timed_events:
+        if not all_day_events:
+            rows.append({"kind": "empty", "text": "Nothing scheduled"})
+        else:
+            rows.append({"kind": "empty", "text": "No timed events"})
+        return
+
+    now = datetime.now()
+    is_today = day == date.today()
+    placed_now = not is_today
+
+    # Conflict detection
+    conflicts: set[str] = set()
+    for i in range(len(timed_events)):
+        s_i, e_i = parse_when(timed_events[i]["start"]), parse_when(timed_events[i]["end"])
+        for j in range(i + 1, len(timed_events)):
+            s_j, e_j = parse_when(timed_events[j]["start"]), parse_when(timed_events[j]["end"])
+            if max(s_i, s_j) < min(e_i, e_j):
+                conflicts.add(timed_events[i]["instance_id"])
+                conflicts.add(timed_events[j]["instance_id"])
+
+    # Column allocation for concurrent / overlapping events
+    col_ends: list[datetime] = []
+    event_cols: dict[str, int] = {}
+    for e in timed_events:
+        s = parse_when(e["start"])
+        end = parse_when(e["end"])
+        placed_col = None
+        for c, c_end in enumerate(col_ends):
+            if c_end <= s:
+                col_ends[c] = end
+                placed_col = c
+                break
+        if placed_col is None:
+            placed_col = len(col_ends)
+            col_ends.append(end)
+        event_cols[e["instance_id"]] = placed_col
+
+    # Merged busy intervals
+    intervals = [(parse_when(e["start"]), parse_when(e["end"])) for e in timed_events]
+    merged: list[list[datetime]] = []
+    for s, e_dt in sorted(intervals):
+        if not merged or s > merged[-1][1]:
+            merged.append([s, e_dt])
+        else:
+            merged[-1][1] = max(merged[-1][1], e_dt)
+
+    # Process events and gaps
+    for b_idx, (b_start, b_end) in enumerate(merged):
+        block_events = [e for e in timed_events if b_start <= parse_when(e["start"]) < b_end]
+        for e in block_events:
+            e_start = parse_when(e["start"])
+            e_end = parse_when(e["end"])
+            if not placed_now and now <= e_start:
+                rows.append({"kind": "now", "text": fmt_time(now, state.hour24)})
+                placed_now = True
+
+            dur_min = max(0, int((e_end - e_start).total_seconds() // 60))
+            col = event_cols[e["instance_id"]]
+            conflict = e["instance_id"] in conflicts
+            rows.append(
+                {
+                    "kind": "event",
+                    "event": e,
+                    "timeline": True,
+                    "col": col,
+                    "conflict": conflict,
+                    "dur_min": dur_min,
+                }
+            )
+            for cont_text in event_continuation_lines(e, dur_min):
+                rows.append(
+                    {
+                        "kind": "event_cont",
+                        "event": e,
+                        "col": col,
+                        "text": cont_text,
+                    }
+                )
+
+        # Gap before next busy block
+        if b_idx < len(merged) - 1:
+            gap_s = merged[b_idx][1]
+            gap_e = merged[b_idx + 1][0]
+            gap_min = int((gap_e - gap_s).total_seconds() // 60)
+            if gap_min >= 10:
+                if not placed_now and gap_s <= now <= gap_e:
+                    m_before = int((now - gap_s).total_seconds() // 60)
+                    m_after = int((gap_e - now).total_seconds() // 60)
+                    if m_before >= 15:
+                        rows.append({"kind": "gap", "text": fmt_gap_bar(gap_s, now, m_before, state.hour24)})
+                    rows.append({"kind": "now", "text": fmt_time(now, state.hour24)})
+                    placed_now = True
+                    if m_after >= 15:
+                        rows.append({"kind": "gap", "text": fmt_gap_bar(now, gap_e, m_after, state.hour24)})
+                else:
+                    if not placed_now and now <= gap_s:
+                        rows.append({"kind": "now", "text": fmt_time(now, state.hour24)})
+                        placed_now = True
+                    rows.append({"kind": "gap", "text": fmt_gap_bar(gap_s, gap_e, gap_min, state.hour24)})
+
+    if not placed_now:
+        rows.append({"kind": "now", "text": fmt_time(now, state.hour24)})
+        placed_now = True
 
 
 def rebuild_rows(state: AppState) -> None:
@@ -752,6 +939,8 @@ def rebuild_rows(state: AppState) -> None:
         rows += [{"kind": "event", "event": e, "show_date": True} for e in pending]
         if not pending:
             rows.append({"kind": "empty", "text": "No pending invites"})
+    elif state.view == "day" and state.day_timeline:
+        build_day_timeline(state, rows, visible)
     else:
         start, end = state.window()
         now = datetime.now()
@@ -1077,6 +1266,22 @@ def toggle_calendar(state: AppState, n: int) -> None:
         rebuild_rows(state)
 
 
+def toggle_day_timeline(state: AppState) -> None:
+    was_month = state.view == "month"
+    if state.view != "day":
+        state.view = "day"
+        state.day_timeline = True
+    else:
+        state.day_timeline = not state.day_timeline
+    save_prefs({"day_timeline": state.day_timeline})
+    log_append(state, f"timeline {'on' if state.day_timeline else 'off'}")
+    if was_month:
+        load_async(state)
+    else:
+        with state.lock:
+            rebuild_rows(state)
+
+
 def change_day(state: AppState, delta: int) -> None:
     state.focus_day += timedelta(days=delta)
     state.cursor = 0
@@ -1246,6 +1451,8 @@ def handle_normal_input(state: AppState, key: int) -> bool:
         state.view = "day" if state.view == "invites" else "invites"
         with state.lock:
             rebuild_rows(state)
+    elif k == "v":
+        toggle_day_timeline(state)
     elif key in (10, 13, curses.KEY_ENTER) or k == "o":
         if state.view == "month" and key in (10, 13, curses.KEY_ENTER):
             state.view = "day"
@@ -1285,7 +1492,7 @@ def handle_normal_input(state: AppState, key: int) -> bool:
 # ---------------------------------------------------------------------------
 
 FOOTER = [
-    "←→ Day | [ ] Week | T Today | W Week view | C Month | I Invites | 1-9 Calendars | R Reload | Q Quit",
+    "←→ Day | [ ] Week | T Today | W Week | C Month | I Invites | V Timeline | 1-9 Cals | R Reload | Q Quit",
     "O Join | G Google | A Accept | D Decline | M Maybe | N New | E Edit | X Delete | S Sync | U Auto-sync",
 ]
 
@@ -1301,7 +1508,10 @@ def addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
 def cal_attr(state: AppState, slug: str) -> int:
     for i, c in enumerate(state.calendars):
         if c["slug"] == slug:
-            return curses.color_pair(10 + i) if curses.has_colors() else 0
+            try:
+                return curses.color_pair(10 + i) if curses.has_colors() else 0
+            except curses.error:
+                return 0
     return 0
 
 
@@ -1322,12 +1532,57 @@ def draw_event_row(stdscr, state: AppState, y: int, row: dict, selected: bool, w
     base = curses.A_REVERSE if selected else (curses.A_DIM if past or status == "declined" else 0)
     addstr(stdscr, y, 0, " " * width, base)
     addstr(stdscr, y, 1, "▸" if selected else " ", base)
-    col = 3 + (25 if row.get("show_date") else 14)
-    addstr(stdscr, y, 3, when, base)
-    addstr(stdscr, y, col, "●", base | cal_attr(state, e["calendar"]))
-    addstr(stdscr, y, col + 2, glyph, base)
-    title_attr = base if past else base | curses.A_BOLD
-    addstr(stdscr, y, col + 4, f"{e['summary'] or '(no title)'}{link}", title_attr)
+
+    if row.get("timeline") and not e["all_day"]:
+        col_idx = row.get("col", 0)
+        conflict = row.get("conflict", False)
+        dur_min = row.get("dur_min", 0)
+        dot_x = event_dot_x(state, col_idx)
+
+        addstr(stdscr, y, 3, when, base)
+        if col_idx > 0:
+            addstr(stdscr, y, dot_x - 4, "  ↳ ", base | (curses.A_DIM if not selected else 0))
+        addstr(stdscr, y, dot_x, "●", base | cal_attr(state, e["calendar"]))
+        addstr(stdscr, y, dot_x + 2, glyph, base)
+        dur_badge = fmt_duration_badge(dur_min)
+        conflict_badge = " ⚡" if conflict else ""
+        title_attr = base if past else base | curses.A_BOLD
+        addstr(
+            stdscr,
+            y,
+            dot_x + 4,
+            f"{e['summary'] or '(no title)'}{dur_badge}{conflict_badge}{link}",
+            title_attr,
+        )
+    else:
+        col = 3 + (25 if row.get("show_date") else 14)
+        addstr(stdscr, y, 3, when, base)
+        addstr(stdscr, y, col, "●", base | cal_attr(state, e["calendar"]))
+        addstr(stdscr, y, col + 2, glyph, base)
+        title_attr = base if past else base | curses.A_BOLD
+        addstr(stdscr, y, col + 4, f"{e['summary'] or '(no title)'}{link}", title_attr)
+
+
+def draw_event_cont_row(stdscr, state: AppState, y: int, row: dict, selected: bool, width: int) -> None:
+    e = row["event"]
+    status = my_status(e, state.my_emails)
+    past = not e["all_day"] and parse_when(e["end"]) < datetime.now()
+    base = curses.A_REVERSE if selected else (curses.A_DIM if past or status == "declined" else 0)
+    addstr(stdscr, y, 0, " " * width, base)
+
+    col_idx = row.get("col", 0)
+    dot_x = event_dot_x(state, col_idx)
+
+    addstr(stdscr, y, dot_x, "│", base | cal_attr(state, e["calendar"]))
+    text = row.get("text", "")
+    if text:
+        text_attr = base | (curses.A_DIM if not selected else 0)
+        addstr(stdscr, y, dot_x + 4, text, text_attr)
+
+
+def draw_gap_row(stdscr, y: int, row: dict, width: int) -> None:
+    addstr(stdscr, y, 0, " " * width, 0)
+    addstr(stdscr, y, 3, row["text"], curses.A_DIM)
 
 
 def draw_month(stdscr, state: AppState, top: int) -> None:
@@ -1452,7 +1707,7 @@ def draw(stdscr, state: AppState) -> None:
     # Header
     start, end = state.window()
     title = {
-        "day": f"{start:%a %b %-d, %Y}",
+        "day": f"{start:%a %b %-d, %Y}" + ("  · timeline" if state.day_timeline else ""),
         "week": f"Week of {start:%b %-d} to {end:%b %-d}",
         "month": f"{state.focus_day:%B %Y}",
         "invites": "Invites",
@@ -1496,6 +1751,12 @@ def draw(stdscr, state: AppState) -> None:
                 addstr(stdscr, y, 3, f"── now {row['text']} " + "─" * (w - 20), curses.color_pair(1))
             elif kind == "empty":
                 addstr(stdscr, y, 3, row["text"], curses.A_DIM)
+            elif kind == "gap":
+                draw_gap_row(stdscr, y, row, w)
+            elif kind == "event_cont":
+                sel_ev = state.selected()
+                is_sel = sel_ev is not None and row["event"]["instance_id"] == sel_ev["instance_id"]
+                draw_event_cont_row(stdscr, state, y, row, is_sel, w)
             else:
                 draw_event_row(stdscr, state, y, row, scroll + i == state.cursor, w)
 
