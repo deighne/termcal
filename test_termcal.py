@@ -621,6 +621,92 @@ class TimelineTests(unittest.TestCase):
         self.assertIn("V Timeline", rendered)  # Footer key guide
 
 
+class AccountsModalTests(unittest.TestCase):
+    def test_get_calendar_info(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cal_dir = tmp_path / "work" / ".caldir"
+            cal_dir.mkdir(parents=True)
+            (cal_dir / "config.toml").write_text(
+                'provider = "google"\ngoogle_account = "user@example.com"\ngoogle_calendar_id = "c_12345"\n'
+            )
+            cal = {"slug": "work", "name": "Work", "color": "#0000ff", "read_only": False}
+            info = tc.get_calendar_info(tmp_path, cal)
+            self.assertEqual(info["slug"], "work")
+            self.assertEqual(info["provider"], "google")
+            self.assertEqual(info["account"], "user@example.com")
+            self.assertFalse(info["read_only"])
+
+    def test_dispatch_accounts_and_navigation(self) -> None:
+        with patch.object(tc, "read_config", return_value={}):
+            state = tc.AppState()
+        state.calendars = [
+            {"slug": "personal", "name": "Personal", "color": "#00ff00", "read_only": False},
+            {"slug": "work", "name": "Work", "color": "#0000ff", "read_only": False},
+        ]
+        tc.dispatch_accounts(state)
+        self.assertIsNotNone(state.modal)
+        self.assertEqual(state.modal["type"], "accounts")
+        self.assertEqual(len(state.modal["items"]), 2)
+        self.assertEqual(state.modal["index"], 0)
+
+        # Navigate down
+        tc.handle_modal_input(state, ord("j"))
+        self.assertEqual(state.modal["index"], 1)
+
+        # Navigate up
+        tc.handle_modal_input(state, ord("k"))
+        self.assertEqual(state.modal["index"], 0)
+
+    def test_accounts_modal_actions(self) -> None:
+        with patch.object(tc, "read_config", return_value={"default_calendar": "personal"}):
+            state = tc.AppState()
+        state.calendars = [
+            {"slug": "personal", "name": "Personal", "color": "#00ff00", "read_only": False},
+            {"slug": "holidays", "name": "Holidays", "color": "#ff0000", "read_only": True},
+        ]
+        tc.dispatch_accounts(state)
+
+        # Toggle visibility with Space
+        with patch.object(tc, "save_prefs") as mock_save:
+            tc.handle_modal_input(state, ord(" "))
+            self.assertIn("personal", state.hidden)
+            mock_save.assert_called_with({"hidden_calendars": ["personal"]})
+
+        # Try to set read-only holidays as default -> should show error
+        state.modal["index"] = 1
+        tc.handle_modal_input(state, ord("d"))
+        self.assertIn("read-only", state.modal["error"])
+
+        # Set personal as default
+        state.modal["index"] = 0
+        with patch.object(tc, "save_prefs") as mock_save:
+            tc.handle_modal_input(state, ord("d"))
+            self.assertIsNone(state.modal["error"])
+            self.assertEqual(state.default_calendar, "personal")
+            mock_save.assert_called_with({"default_calendar": "personal"})
+
+        # Close with Esc
+        tc.handle_modal_input(state, 27)
+        self.assertIsNone(state.modal)
+
+    def test_render_accounts_modal(self) -> None:
+        with patch.object(tc, "read_config", return_value={"default_calendar": "work"}):
+            state = tc.AppState()
+        state.calendars = [
+            {"slug": "work", "name": "Work", "color": "#0000ff", "read_only": False},
+        ]
+        tc.dispatch_accounts(state)
+        scr = FakeScreen([], h=30, w=100)
+        tc.draw(scr, state)
+        rendered = scr.rendered_text()
+
+        self.assertIn("Connected Accounts & Calendars", rendered)
+        self.assertIn("Work", rendered)
+        self.assertIn("★", rendered)  # Default badge
+        self.assertIn("caldir connect", rendered)  # Connect command hint
+
+
 class CliArgTests(unittest.TestCase):
     def test_version_flag(self) -> None:
         with self.assertRaises(SystemExit) as ctx, patch("sys.stdout", new_callable=io.StringIO) as out:

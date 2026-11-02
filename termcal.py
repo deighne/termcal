@@ -527,9 +527,9 @@ class AppState:
         self.config = read_config()
         self.calendar_dir = Path(self.config.get("calendar_dir", "~/caldir")).expanduser()
         self.hour24 = self.config.get("time_format", "24h") == "24h"
-        self.default_calendar = self.config.get("default_calendar", "")
+        self.default_calendar = load_prefs().get("default_calendar", self.config.get("default_calendar", ""))
         self.calendars: list[dict] = []
-        self.hidden: set[str] = set()
+        self.hidden: set[str] = set(load_prefs().get("hidden_calendars", []))
         self.my_emails: set[str] = set()
         self.events: list[dict] = []
         self.invites: list[dict] = []
@@ -1256,11 +1256,62 @@ def dispatch_new(state: AppState) -> None:
     }
 
 
+def get_calendar_info(calendar_dir: Path, cal: dict) -> dict:
+    """Read provider, account, and configuration details for one calendar."""
+    slug = cal["slug"]
+    conf_path = calendar_dir / slug / ".caldir" / "config.toml"
+    info = {
+        "slug": slug,
+        "name": cal.get("name") or slug,
+        "color": cal.get("color") or "",
+        "read_only": bool(cal.get("read_only")),
+        "provider": "local",
+        "account": "",
+        "path": str(calendar_dir / slug),
+    }
+    try:
+        text = conf_path.read_text(errors="replace")
+    except OSError:
+        return info
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if "=" not in line or line.startswith("#"):
+            continue
+        key, val = [p.strip() for p in line.split("=", 1)]
+        val = val.strip("\"'")
+        if key == "provider":
+            info["provider"] = val
+        elif key in ("google_account", "apple_id", "microsoft_account", "username", "user"):
+            if not info["account"]:
+                info["account"] = val
+        elif key == "url" and not info["account"]:
+            m = re.search(r"https?://([^/@:]+)", val)
+            if m:
+                info["account"] = m.group(1)
+
+    return info
+
+
+def dispatch_accounts(state: AppState) -> None:
+    """Open the Connected Accounts & Calendars modal."""
+    items = [get_calendar_info(state.calendar_dir, c) for c in state.calendars]
+    state.modal = {
+        "type": "accounts",
+        "title": "Connected Accounts & Calendars",
+        "items": items,
+        "index": 0,
+        "error": None,
+    }
+    state.dirty = True
+
+
 def toggle_calendar(state: AppState, n: int) -> None:
     if n >= len(state.calendars):
         return
     slug = state.calendars[n]["slug"]
     state.hidden ^= {slug}
+    save_prefs({"hidden_calendars": list(state.hidden)})
     log_append(state, f"{'hid' if slug in state.hidden else 'showing'} {state.calendars[n]['name']}")
     with state.lock:
         rebuild_rows(state)
@@ -1369,9 +1420,59 @@ def handle_prompt_input(state: AppState, key: int) -> None:
     state.dirty = True
 
 
+def handle_accounts_modal_input(state: AppState, key: int) -> None:
+    m = state.modal
+    if not m:
+        return
+    items = m.get("items", [])
+    k = chr(key) if 0 <= key < 256 else ""
+
+    if key in (27, 10, 13, curses.KEY_ENTER) or k in ("q", "Q", "A", ","):
+        state.modal = None
+    elif items and (key == curses.KEY_UP or k == "k"):
+        m["index"] = (m["index"] - 1) % len(items)
+        m["error"] = None
+    elif items and (key == curses.KEY_DOWN or k == "j" or key == 9):
+        m["index"] = (m["index"] + 1) % len(items)
+        m["error"] = None
+    elif items and (key == ord(" ") or k == "v"):
+        slug = items[m["index"]]["slug"]
+        state.hidden ^= {slug}
+        save_prefs({"hidden_calendars": list(state.hidden)})
+        log_append(state, f"{'hid' if slug in state.hidden else 'showing'} {items[m['index']]['name']}")
+        with state.lock:
+            rebuild_rows(state)
+    elif items and k in ("d", "D"):
+        sel = items[m["index"]]
+        if sel["read_only"]:
+            m["error"] = f"{sel['name']} is read-only and cannot be default"
+        else:
+            state.default_calendar = sel["slug"]
+            save_prefs({"default_calendar": state.default_calendar})
+            m["error"] = None
+            log_append(state, f"default calendar set to {sel['name']}")
+    elif k in ("s", "S"):
+        state.modal = None
+        queue_sync(state, full=False)
+    elif items and k.isdigit() and k != "0":
+        idx = int(k) - 1
+        if idx < len(items):
+            m["index"] = idx
+            slug = items[idx]["slug"]
+            state.hidden ^= {slug}
+            save_prefs({"hidden_calendars": list(state.hidden)})
+            log_append(state, f"{'hid' if slug in state.hidden else 'showing'} {items[idx]['name']}")
+            with state.lock:
+                rebuild_rows(state)
+    state.dirty = True
+
+
 def handle_modal_input(state: AppState, key: int) -> None:
     m = state.modal
     if not m:
+        return
+    if m.get("type") == "accounts":
+        handle_accounts_modal_input(state, key)
         return
     fields = m["fields"]
     f = fields[m["index"]]
@@ -1453,6 +1554,8 @@ def handle_normal_input(state: AppState, key: int) -> bool:
             rebuild_rows(state)
     elif k == "v":
         toggle_day_timeline(state)
+    elif k in ("A", ","):
+        dispatch_accounts(state)
     elif key in (10, 13, curses.KEY_ENTER) or k == "o":
         if state.view == "month" and key in (10, 13, curses.KEY_ENTER):
             state.view = "day"
@@ -1492,7 +1595,7 @@ def handle_normal_input(state: AppState, key: int) -> bool:
 # ---------------------------------------------------------------------------
 
 FOOTER = [
-    "←→ Day | [ ] Week | T Today | W Week | C Month | I Invites | V Timeline | 1-9 Cals | R Reload | Q Quit",
+    "←→ Day | [ ] Wk | T Today | W Week | C Month | I Invites | V Timeline | A Accounts | 1-9 Cals | Q Quit",
     "O Join | G Google | A Accept | D Decline | M Maybe | N New | E Edit | X Delete | S Sync | U Auto-sync",
 ]
 
@@ -1644,6 +1747,103 @@ def draw_detail(stdscr, state: AppState, top: int, width: int) -> None:
         addstr(stdscr, top + 1 + i, 2, text, attr)
 
 
+def draw_accounts_modal(stdscr, state: AppState, h: int, w: int) -> None:
+    m = state.modal
+    if not m:
+        return
+    items = m.get("items", [])
+    box_w = min(max(70, w - 6), 86)
+    content_rows = max(len(items), 1)
+    box_h = min(h - 4, content_rows + 9)
+    top = max(1, (h - box_h) // 2)
+    left = max(2, (w - box_w) // 2)
+
+    for r in range(box_h):
+        addstr(stdscr, top + r, left, " " * box_w, 0)
+    addstr(stdscr, top, left, "┌" + "─" * (box_w - 2) + "┐", curses.A_BOLD)
+    for r in range(1, box_h - 1):
+        addstr(stdscr, top + r, left, "│", curses.A_BOLD)
+        addstr(stdscr, top + r, left + box_w - 1, "│", curses.A_BOLD)
+    addstr(stdscr, top + box_h - 1, left, "└" + "─" * (box_w - 2) + "┘", curses.A_BOLD)
+
+    title = f" {m['title']} ({len(items)}) "
+    addstr(stdscr, top, left + 2, title, curses.A_BOLD | curses.A_REVERSE)
+
+    hdr_y = top + 2
+    addstr(
+        stdscr,
+        hdr_y,
+        left + 2,
+        " #  Status  Calendar            Provider   Account",
+        curses.A_DIM | curses.A_UNDERLINE,
+    )
+
+    list_top = top + 3
+    max_visible_items = max(1, box_h - 9)
+    scroll = max(0, min(m["index"] - max_visible_items + 1, len(items) - max_visible_items))
+    visible_items = items[scroll : scroll + max_visible_items]
+
+    if not items:
+        addstr(stdscr, list_top, left + 4, "No calendars connected.", curses.A_DIM)
+    else:
+        for idx_offset, item in enumerate(visible_items):
+            actual_idx = scroll + idx_offset
+            y = list_top + idx_offset
+            focused = actual_idx == m["index"]
+            is_hidden = item["slug"] in state.hidden
+            is_default = item["slug"] == state.default_calendar
+
+            base = curses.A_REVERSE if focused else 0
+            addstr(stdscr, y, left + 1, " " * (box_w - 2), base)
+            addstr(stdscr, y, left + 1, "▸" if focused else " ", base)
+
+            num_str = f"{actual_idx + 1:2d}"
+            addstr(stdscr, y, left + 3, num_str, base | (curses.A_DIM if not focused else 0))
+
+            if is_hidden:
+                addstr(stdscr, y, left + 8, "○", base | curses.A_DIM)
+            else:
+                addstr(stdscr, y, left + 8, "●", base | cal_attr(state, item["slug"]))
+
+            name_str = item["name"][:18]
+            if is_default:
+                name_str += " ★"
+            if item["read_only"]:
+                name_str += " [RO]"
+            name_attr = base | (curses.A_BOLD if not is_hidden else 0)
+            addstr(stdscr, y, left + 13, name_str[:20].ljust(20), name_attr)
+
+            prov_str = item["provider"].capitalize()[:10]
+            addstr(stdscr, y, left + 35, prov_str.ljust(10), base)
+
+            acc_w = max(10, box_w - 48 - 4)
+            acc_str = item["account"] or "(local)"
+            addstr(stdscr, y, left + 47, acc_str[:acc_w], base | (curses.A_DIM if not focused else 0))
+
+    div_y = top + box_h - 6
+    addstr(stdscr, div_y, left, "├" + "─" * (box_w - 2) + "┤", curses.A_BOLD)
+
+    if items and 0 <= m["index"] < len(items):
+        sel = items[m["index"]]
+        is_def = "Yes" if sel["slug"] == state.default_calendar else "No"
+        vis_str = "Hidden" if sel["slug"] in state.hidden else "Visible"
+        det_line1 = f"Selected: {sel['name']} ({sel['slug']}) · {vis_str}"
+        ro_str = "No" if sel["read_only"] else "Yes"
+        det_line2 = f"Path: {sel['path']} · Default: {is_def} · Writable: {ro_str}"
+        addstr(stdscr, div_y + 1, left + 2, det_line1[: box_w - 4], curses.A_BOLD)
+        addstr(stdscr, div_y + 2, left + 2, det_line2[: box_w - 4], curses.A_DIM)
+
+    footer_y = top + box_h - 3
+    if m.get("error"):
+        err_attr = curses.color_pair(1) | curses.A_BOLD
+        addstr(stdscr, footer_y, left + 2, f"! {m['error']}"[: box_w - 4], err_attr)
+    else:
+        hint1 = "Space/1-9 toggle visible · D set default · S sync · Esc close"
+        addstr(stdscr, footer_y, left + 2, hint1[: box_w - 4], curses.A_DIM)
+    hint2 = "Connect new: caldir connect google | icloud | outlook | caldav"
+    addstr(stdscr, footer_y + 1, left + 2, hint2[: box_w - 4], curses.A_DIM)
+
+
 def draw_modal(stdscr, state: AppState, h: int, w: int) -> None:
     m = state.modal
     if not m:
@@ -1776,7 +1976,10 @@ def draw(stdscr, state: AppState) -> None:
         addstr(stdscr, h - 1, 0, f" {FOOTER[1]}".ljust(w), curses.A_REVERSE)
 
     if state.modal:
-        draw_modal(stdscr, state, h, w)
+        if state.modal.get("type") == "accounts":
+            draw_accounts_modal(stdscr, state, h, w)
+        else:
+            draw_modal(stdscr, state, h, w)
 
     stdscr.refresh()
 

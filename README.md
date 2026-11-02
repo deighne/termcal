@@ -22,7 +22,7 @@ caldir owns the data (a local directory of `.ics` files synced to Google Calenda
   ⧉  https://meet.google.com/...
   from Alex Rivera
  10:12:03 sync complete
- ←→ Day | [ ] Week | T Today | W Week | C Month | I Invites | V Timeline | 1-9 Cals | R Reload | Q Quit
+ ←→ Day | [ ] Wk | T Today | W Week | C Month | I Invites | V Timeline | A Accounts | 1-9 Cals | Q Quit
  O Join | G Google | A Accept | D Decline | M Maybe | N New | E Edit | X Delete | S Sync | U Auto-sync
 ```
 
@@ -101,6 +101,7 @@ termcal --check
 | `u` | Toggle auto-sync (remembered between runs) |
 | `r` | Reload from the local store |
 | `1`-`9` | Toggle calendar visibility |
+| `A` / `,` | Connected accounts & calendars modal (view providers, accounts, paths, set default, toggle visibility) |
 | `q` | Quit |
 
 ## How it maps to caldir
