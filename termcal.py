@@ -18,11 +18,13 @@ import os
 import queue
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
+import zlib
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -48,6 +50,120 @@ MEETING_URL_RE = re.compile(
     re.IGNORECASE,
 )
 RSVP_GLYPH = {"accepted": "✓", "declined": "✗", "tentative": "?", "needs_action": "•"}
+
+LSREGISTER_BIN = Path(
+    "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+)
+
+MACOS_INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>org.caldir.termcal</string>
+    <key>CFBundleName</key>
+    <string>TermCal</string>
+    <key>CFBundleDisplayName</key>
+    <string>TermCal</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleExecutable</key>
+    <string>termcal-launcher</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>iCalendar File</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.apple.ical.ics</string>
+                <string>public.calendar-date</string>
+            </array>
+        </dict>
+    </array>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>Calendar URL</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>webcal</string>
+                <string>ical</string>
+                <string>calshow</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>
+"""
+
+MACOS_LAUNCHER_SCRIPT = """#!/bin/bash
+# TermCal macOS Application Wrapper
+TARGET="$1"
+
+# Resolve termcal binary
+TERMCAL_BIN="$(which termcal 2>/dev/null)"
+if [ -z "$TERMCAL_BIN" ]; then
+    CANDIDATES=(
+        "{python_bin_dir}/termcal"
+        "$HOME/.local/bin/termcal"
+        "/opt/homebrew/bin/termcal"
+        "/usr/local/bin/termcal"
+    )
+    for candidate in "${CANDIDATES[@]}"; do
+        if [ -x "$candidate" ]; then
+            TERMCAL_BIN="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "$TERMCAL_BIN" ]; then
+    MSG="Could not locate termcal on PATH or in standard Homebrew/pipx locations."
+    osascript -e "display alert \\\"TermCal Not Found\\\" message \\\"$MSG\\\""
+    exit 1
+fi
+
+CMD="'$TERMCAL_BIN'"
+if [ -n "$TARGET" ]; then
+    CMD="$CMD '$TARGET'"
+fi
+
+# Detect active / preferred terminal emulator
+if pgrep -qx "iTerm2"; then
+    osascript <<EOF
+tell application "iTerm"
+    create window with default profile command "$CMD"
+    activate
+end tell
+EOF
+elif pgrep -qx "ghostty"; then
+    open -na "Ghostty" --args -e "$TERMCAL_BIN $TARGET"
+elif pgrep -qx "kitty"; then
+    kitty --detach "$TERMCAL_BIN" "$TARGET"
+elif pgrep -qx "alacritty" || pgrep -qx "Alacritty"; then
+    open -na "Alacritty" --args -e "$TERMCAL_BIN" "$TARGET"
+else
+    # Default macOS Terminal.app fallback
+    osascript <<EOF
+tell application "Terminal"
+    do script "$CMD"
+    activate
+end tell
+EOF
+fi
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +537,250 @@ def update_ics_event(
 
     path.write_text(crlf.join(new_lines) + crlf)
     return path
+
+
+def ics_unescape(value: str) -> str:
+    """Reverse RFC 5545 string escaping."""
+    return (
+        value.replace(r"\n", "\n")
+        .replace(r"\N", "\n")
+        .replace(r"\,", ",")
+        .replace(r"\;", ";")
+        .replace(r"\\", "\\")
+    )
+
+
+def parse_ics_timestamp(raw_val: str, params: str = "") -> tuple[date | datetime, bool]:
+    """Parse an RFC 5545 date/datetime value. Returns (date_or_dt, is_all_day)."""
+    val = raw_val.strip()
+    if "VALUE=DATE" in params.upper() or (len(val) == 8 and val.isdigit()):
+        return date(int(val[:4]), int(val[4:6]), int(val[6:8])), True
+    if val.endswith("Z"):
+        clean = val[:-1]
+        dt = datetime(
+            int(clean[:4]),
+            int(clean[4:6]),
+            int(clean[6:8]),
+            int(clean[9:11]),
+            int(clean[11:13]),
+            int(clean[13:15]) if len(clean) >= 15 else 0,
+            tzinfo=UTC,
+        )
+        return dt.astimezone().replace(tzinfo=None), False
+    parts = val.split("T")
+    time_part = parts[1][:6].ljust(6, "0") if len(parts) > 1 else "000000"
+    dt = datetime(
+        int(parts[0][:4]),
+        int(parts[0][4:6]),
+        int(parts[0][6:8]),
+        int(time_part[:2]),
+        int(time_part[2:4]),
+        int(time_part[4:6]),
+    )
+    return dt, False
+
+
+def parse_ics_duration(raw_val: str) -> timedelta:
+    """Parse an RFC 5545 duration string (e.g. PT1H30M, P1D)."""
+    val = raw_val.strip().upper()
+    m = re.match(r"^P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$", val)
+    if not m:
+        return timedelta(minutes=30)
+    weeks, days, hours, mins, secs = (int(x or 0) for x in m.groups())
+    return timedelta(weeks=weeks, days=days, hours=hours, minutes=mins, seconds=secs)
+
+
+def parse_raw_ics(source: Path | str) -> dict | None:
+    """Parse primary VEVENT from an .ics file path or raw string content."""
+    try:
+        if isinstance(source, Path) or (
+            isinstance(source, str) and "\n" not in source and Path(source).is_file()
+        ):
+            text = Path(source).read_text(errors="replace")
+        else:
+            text = str(source)
+    except OSError:
+        return None
+
+    # Unfold RFC 5545 lines
+    text = re.sub(r"\r?\n[ \t]", "", text)
+
+    in_vevent = False
+    event: dict = {
+        "uid": None,
+        "summary": "Untitled Event",
+        "start": None,
+        "end": None,
+        "duration": None,
+        "all_day": False,
+        "location": "",
+        "description": "",
+        "organizer": "",
+    }
+    found = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line == "BEGIN:VEVENT":
+            in_vevent = True
+            found = True
+            continue
+        if line == "END:VEVENT":
+            break
+        if not in_vevent or ":" not in line:
+            continue
+
+        raw_prop, raw_val = line.split(":", 1)
+        prop_parts = raw_prop.split(";")
+        name = prop_parts[0].upper()
+        params = ";".join(prop_parts[1:]) if len(prop_parts) > 1 else ""
+
+        if name == "SUMMARY":
+            event["summary"] = ics_unescape(raw_val)
+        elif name == "UID":
+            event["uid"] = raw_val
+        elif name == "LOCATION":
+            event["location"] = ics_unescape(raw_val)
+        elif name == "DESCRIPTION":
+            event["description"] = ics_unescape(raw_val)
+        elif name == "ORGANIZER":
+            event["organizer"] = ics_unescape(raw_val)
+        elif name == "DTSTART":
+            dt, all_day = parse_ics_timestamp(raw_val, params)
+            event["start"] = dt
+            event["all_day"] = all_day
+        elif name == "DTEND":
+            dt, _ = parse_ics_timestamp(raw_val, params)
+            event["end"] = dt
+        elif name == "DURATION":
+            event["duration"] = parse_ics_duration(raw_val)
+
+    if not found:
+        return None
+
+    if event["duration"] is None:
+        if event["start"] and event["end"]:
+            st, en = event["start"], event["end"]
+            if (
+                isinstance(st, date)
+                and not isinstance(st, datetime)
+                and isinstance(en, date)
+                and not isinstance(en, datetime)
+            ):
+                event["duration"] = timedelta(days=(en - st).days)
+            elif isinstance(st, datetime) and isinstance(en, datetime):
+                event["duration"] = en - st
+            else:
+                event["duration"] = timedelta(days=1) if event["all_day"] else timedelta(minutes=30)
+        else:
+            event["duration"] = timedelta(days=1) if event["all_day"] else timedelta(minutes=30)
+
+    if event["end"] is None and event["start"]:
+        event["end"] = event["start"] + event["duration"]
+
+    return event
+
+
+def parse_target_argument(
+    target: str, default_day: date | None = None
+) -> tuple[str, date | None, Path | None, dict | None]:
+    """Parse a command-line target argument.
+
+    Returns (kind, focus_day, file_path, event_info) where kind is:
+      - 'ics': an .ics file path (event start date, resolved Path, event_info dict)
+      - 'date': a date expression or calshow URI (focus_day is parsed date)
+      - 'url': a webcal/ical calendar URL
+      - 'unknown': unparseable target
+    """
+    s = target.strip()
+    if not s:
+        return "unknown", None, None, None
+
+    lower = s.lower()
+    base_day = default_day or date.today()
+
+    # 1. URL schemes
+    if lower.startswith(("webcal://", "ical://", "http://", "https://")):
+        return "url", None, None, None
+
+    # 2. calshow: scheme
+    if lower.startswith("calshow:"):
+        param = s[8:].lstrip("/")
+        if not param:
+            return "date", base_day, None, None
+        try:
+            d = date.fromisoformat(param)
+            return "date", d, None, None
+        except ValueError:
+            pass
+        if param.isdigit() or (param.startswith("-") and param[1:].isdigit()):
+            ts = int(param)
+            # Cocoa epoch seconds offset (2001-01-01) vs Unix epoch (1970-01-01)
+            unix_ts = ts + 978307200 if 0 < ts < 1_000_000_000 else ts
+            try:
+                d = datetime.fromtimestamp(unix_ts).date()
+                return "date", d, None, None
+            except (OSError, OverflowError, ValueError):
+                pass
+        try:
+            d, _ = parse_user_when(param, base_day)
+            return "date", d, None, None
+        except ValueError:
+            return "unknown", None, None, None
+
+    # 3. .ics file path
+    p = Path(s).expanduser()
+    if p.is_file() or lower.endswith(".ics"):
+        resolved = p.resolve()
+        info = parse_raw_ics(resolved) if resolved.is_file() else None
+        ev_day = None
+        if info and info.get("start"):
+            st = info["start"]
+            ev_day = st.date() if isinstance(st, datetime) else st
+        return "ics", ev_day or base_day, resolved, info
+
+    # 4. Date expression (e.g. 2026-12-25, today, tomorrow, monday)
+    try:
+        d, _ = parse_user_when(s, base_day)
+        return "date", d, None, None
+    except ValueError:
+        pass
+
+    return "unknown", None, None, None
+
+
+def handle_target_launch(state: AppState, target: str) -> dict | None:
+    """Process a launch target argument and adjust state before local reload."""
+    kind, focus_day, file_path, event_info = parse_target_argument(target, state.focus_day)
+    if focus_day:
+        state.focus_day = focus_day
+
+    if kind == "ics" and file_path:
+        if not file_path.is_file():
+            log_append(state, f"File not found: {file_path}")
+            return None
+        if not event_info:
+            event_info = parse_raw_ics(file_path)
+
+        is_internal = False
+        try:
+            file_path.resolve().relative_to(state.calendar_dir.resolve())
+            is_internal = True
+        except ValueError:
+            is_internal = False
+
+        if is_internal:
+            uid = event_info.get("uid") if event_info else None
+            log_append(state, f"Opened {file_path.name}")
+            return {"internal_uid": uid, "path": file_path, "event_info": event_info}
+        return {"external_ics": True, "path": file_path, "event_info": event_info or {}}
+
+    elif kind == "url":
+        log_append(state, f"Received calendar URL: {target}")
+    elif kind == "unknown":
+        log_append(state, f"Unrecognized target: {target}")
+
+    return None
 
 
 def event_day(event: dict) -> date:
@@ -1319,6 +1679,95 @@ def dispatch_new(state: AppState) -> None:
     }
 
 
+def dispatch_import_event(state: AppState, path: Path, event_info: dict) -> None:
+    """Open the Import Event modal to import an external .ics file."""
+    writable = [c["slug"] for c in state.calendars if not c.get("read_only")]
+    if not writable:
+        log_append(state, "no writable calendars available to import event")
+        return
+
+    default_cal = state.default_calendar if state.default_calendar in writable else writable[0]
+    title = event_info.get("summary") or path.stem.replace("_", " ").title()
+
+    st = event_info.get("start")
+    if isinstance(st, datetime):
+        when_str = f"{st:%Y-%m-%d %H:%M}"
+    elif isinstance(st, date):
+        when_str = f"{st:%Y-%m-%d}"
+    else:
+        when_str = f"{state.focus_day.isoformat()} 09:00"
+
+    dur = event_info.get("duration")
+    if isinstance(dur, timedelta):
+        dur_mins = round(dur.total_seconds() / 60)
+        if dur_mins >= 1440:
+            dur_str = f"{max(1, dur_mins // 1440)}d"
+        elif dur_mins >= 60 and dur_mins % 60 == 0:
+            dur_str = f"{dur_mins // 60}h"
+        elif dur_mins >= 60:
+            dur_str = f"{dur_mins // 60}h {dur_mins % 60}m"
+        else:
+            dur_str = f"{max(1, dur_mins)}m"
+    else:
+        dur_str = "30m"
+
+    loc = event_info.get("location") or ""
+
+    fields = [
+        {"key": "title", "label": "Title", "value": title},
+        {"key": "when", "label": "When", "value": when_str},
+        {"key": "duration", "label": "Duration", "value": dur_str},
+        {"key": "location", "label": "Location", "value": loc},
+        {"key": "calendar", "label": "Import To", "value": default_cal, "choices": writable},
+    ]
+
+    def on_submit(values: dict[str, str]) -> str | None:
+        target_title = values["title"].strip()
+        if not target_title:
+            return "Title is required"
+
+        cal_slug = values["calendar"].strip() or default_cal
+        if cal_slug not in writable:
+            for c in state.calendars:
+                if c["name"].lower() == cal_slug.lower() and c["slug"] in writable:
+                    cal_slug = c["slug"]
+                    break
+            else:
+                return f"Unknown calendar '{cal_slug}' (use ←/→ to choose)"
+
+        dest_dir = state.calendar_dir / cal_slug
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = dest_dir / path.name
+        if dest_file.exists():
+            dest_file = dest_dir / f"{path.stem}_{int(time.time())}.ics"
+
+        def work():
+            shutil.copy2(path, dest_file)
+            if target_title != title:
+                raw = dest_file.read_text(errors="replace")
+                new_raw = re.sub(
+                    r"SUMMARY:.*?(?=\r?\n)",
+                    f"SUMMARY:{ics_escape(target_title)}",
+                    raw,
+                    count=1,
+                )
+                dest_file.write_text(new_raw)
+            log_append(state, f"imported '{target_title}' into {cal_slug}")
+            after_write(state)
+
+        run_bg(state, "import", work)
+        return None
+
+    state.modal = {
+        "title": "Import Event",
+        "fields": fields,
+        "index": 0,
+        "error": None,
+        "on_submit": on_submit,
+    }
+    state.dirty = True
+
+
 def get_calendar_info(calendar_dir: Path, cal: dict) -> dict:
     """Read provider, account, and configuration details for one calendar."""
     slug = cal["slug"]
@@ -2056,6 +2505,137 @@ def draw(stdscr, state: AppState) -> None:
 
 
 # ---------------------------------------------------------------------------
+# macOS Application Bundle & Integration
+# ---------------------------------------------------------------------------
+
+
+def generate_app_icon_icns() -> bytes:
+    """Generate a valid 128x128 macOS .icns file with calendar + terminal design."""
+    w, h = 128, 128
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)  # PNG filter type 0
+        for x in range(w):
+            in_box = 8 <= x < 120 and 8 <= y < 120
+            if in_box:
+                dx = min(x - 8, 119 - x)
+                dy = min(y - 8, 119 - y)
+                if dx < 16 and dy < 16 and (16 - dx) ** 2 + (16 - dy) ** 2 > 256:
+                    in_box = False
+
+            in_ring = (28 <= x <= 36 or 92 <= x <= 100) and (4 <= y <= 16)
+
+            if in_ring:
+                raw.extend([210, 215, 225, 255])
+            elif not in_box:
+                raw.extend([0, 0, 0, 0])
+            elif y < 38:
+                raw.extend([224, 86, 91, 255])  # Red calendar header
+            else:
+                dy = abs(y - 70)
+                in_chevron = (dy <= 10) and (34 + (10 - dy) - 3 <= x <= 34 + (10 - dy))
+                in_cursor = (52 <= x <= 68) and (78 <= y <= 82)
+                in_dots = (
+                    ((x - 86) ** 2 + (y - 62) ** 2 <= 6)
+                    or ((x - 102) ** 2 + (y - 62) ** 2 <= 6)
+                    or ((x - 86) ** 2 + (y - 78) ** 2 <= 6)
+                    or ((x - 102) ** 2 + (y - 78) ** 2 <= 6)
+                )
+
+                if in_chevron or in_cursor:
+                    raw.extend([90, 247, 142, 255])  # Mint green terminal prompt
+                elif in_dots:
+                    raw.extend([110, 120, 140, 255])  # Calendar grid dots
+                else:
+                    raw.extend([30, 34, 42, 255])  # Dark slate background
+
+    compressed = zlib.compress(bytes(raw), level=9)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", compressed)
+        + chunk(b"IEND", b"")
+    )
+    elem = b"ic07" + struct.pack(">I", len(png) + 8) + png
+    return b"icns" + struct.pack(">I", len(elem) + 8) + elem
+
+
+def install_macos_app(app_path: Path | None = None) -> tuple[bool, str]:
+    """Create ~/Applications/TermCal.app and register with LaunchServices."""
+    target_app = (app_path or (Path.home() / "Applications" / "TermCal.app")).expanduser().resolve()
+    contents_dir = target_app / "Contents"
+    macos_dir = contents_dir / "MacOS"
+    resources_dir = contents_dir / "Resources"
+
+    try:
+        macos_dir.mkdir(parents=True, exist_ok=True)
+        resources_dir.mkdir(parents=True, exist_ok=True)
+
+        (contents_dir / "Info.plist").write_text(MACOS_INFO_PLIST)
+        (contents_dir / "PkgInfo").write_text("APPL????")
+
+        python_bin_dir = str(Path(sys.executable).parent)
+        launcher_content = MACOS_LAUNCHER_SCRIPT.replace("{python_bin_dir}", python_bin_dir)
+        launcher_file = macos_dir / "termcal-launcher"
+        launcher_file.write_text(launcher_content)
+        launcher_file.chmod(0o755)
+
+        (resources_dir / "AppIcon.icns").write_bytes(generate_app_icon_icns())
+
+        registered = False
+        if sys.platform == "darwin" and LSREGISTER_BIN.is_file():
+            res = subprocess.run(
+                [str(LSREGISTER_BIN), "-f", str(target_app)], check=False, capture_output=True
+            )
+            registered = res.returncode == 0
+
+        reg_msg = (
+            "✓ Registered with macOS LaunchServices"
+            if registered
+            else "• Note: LaunchServices registration skipped (lsregister not available or non-macOS)"
+        )
+
+        msg = (
+            f"✓ Installed TermCal.app to {target_app}\n"
+            f"{reg_msg}\n\n"
+            "To make TermCal your default calendar:\n"
+            "  1. Open Calendar.app -> Settings (Cmd-,)\n"
+            '  2. Change "Default calendar app" to TermCal\n\n'
+            "Or run with duti:\n"
+            "  brew install duti && duti -s org.caldir.termcal com.apple.ical.ics all"
+        )
+        return True, msg
+    except OSError as exc:
+        return False, f"Failed to install TermCal.app: {exc}"
+
+
+def uninstall_macos_app(app_path: Path | None = None) -> tuple[bool, str]:
+    """Unregister and remove ~/Applications/TermCal.app."""
+    target_app = (app_path or (Path.home() / "Applications" / "TermCal.app")).expanduser().resolve()
+    if not target_app.exists():
+        return True, f"TermCal.app not found at {target_app} (already uninstalled)."
+
+    try:
+        unregistered = False
+        if sys.platform == "darwin" and LSREGISTER_BIN.is_file():
+            res = subprocess.run(
+                [str(LSREGISTER_BIN), "-u", str(target_app)], check=False, capture_output=True
+            )
+            unregistered = res.returncode == 0
+
+        shutil.rmtree(target_app)
+
+        reg_msg = "✓ Unregistered TermCal.app from macOS LaunchServices\n" if unregistered else ""
+        return True, f"{reg_msg}✓ Removed {target_app}"
+    except OSError as exc:
+        return False, f"Failed to remove TermCal.app: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -2071,15 +2651,26 @@ def init_colors(state: AppState) -> None:
         curses.init_pair(10 + i, color, -1)
 
 
-def tui(stdscr):
+def tui(stdscr, target: str | None = None):
     curses.curs_set(0)
     with contextlib.suppress(curses.error):
         curses.putp(b"\x1b>")  # keep numeric keypad in normal digit mode (DECPNM)
     stdscr.timeout(250)
     state = AppState()
+    target_info = None
+    if target:
+        target_info = handle_target_launch(state, target)
     try:
         load_calendars(state)
         reload_local(state)
+        if target_info and target_info.get("external_ics"):
+            dispatch_import_event(state, target_info["path"], target_info["event_info"])
+        elif target_info and target_info.get("internal_uid"):
+            uid = target_info["internal_uid"]
+            for idx, row in enumerate(state.rows):
+                if row.get("kind") == "event" and row["event"].get("uid") == uid:
+                    state.cursor = idx
+                    break
     except FileNotFoundError:
         raise SystemExit("caldir not found on PATH. Install it first: https://caldir.org") from None
     init_colors(state)
@@ -2124,7 +2715,41 @@ def main(argv: list[str] | None = None):
         action="store_true",
         help="verify caldir installation and configuration without starting the TUI",
     )
+    parser.add_argument(
+        "--install-app",
+        action="store_true",
+        help="install macOS TermCal.app bundle and register with LaunchServices",
+    )
+    parser.add_argument(
+        "--uninstall-app",
+        action="store_true",
+        help="uninstall macOS TermCal.app bundle and unregister from LaunchServices",
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="optional .ics file, date (YYYY-MM-DD), or calshow: URI",
+    )
     args = parser.parse_args(argv)
+
+    if args.install_app:
+        ok, msg = install_macos_app()
+        if ok:
+            print(msg)
+            sys.exit(0)
+        else:
+            print(f"Error: {msg}", file=sys.stderr)
+            sys.exit(1)
+
+    if args.uninstall_app:
+        ok, msg = uninstall_macos_app()
+        if ok:
+            print(msg)
+            sys.exit(0)
+        else:
+            print(f"Error: {msg}", file=sys.stderr)
+            sys.exit(1)
 
     if args.check:
         ok, msg = check_caldir()
@@ -2141,7 +2766,7 @@ def main(argv: list[str] | None = None):
         sys.exit(1)
 
     os.environ.setdefault("ESCDELAY", "25")
-    curses.wrapper(tui)
+    curses.wrapper(tui, args.target)
 
 
 if __name__ == "__main__":
