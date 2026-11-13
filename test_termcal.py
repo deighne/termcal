@@ -362,10 +362,22 @@ class TimelineTests(unittest.TestCase):
             self.assertFalse(state.day_timeline)
             mock_save.assert_called_with({"day_timeline": False})
 
-        # When toggling from week view, should switch to day view with timeline enabled
+        # When toggling from week view, should stay in week view and toggle timeline
         state.view = "week"
         state.day_timeline = False
         with patch.object(tc, "save_prefs"):
+            tc.toggle_day_timeline(state)
+            self.assertEqual(state.view, "week")
+            self.assertTrue(state.day_timeline)
+
+            tc.toggle_day_timeline(state)
+            self.assertEqual(state.view, "week")
+            self.assertFalse(state.day_timeline)
+
+        # When toggling from month view, should switch to day view with timeline enabled
+        state.view = "month"
+        state.day_timeline = False
+        with patch.object(tc, "save_prefs"), patch.object(tc, "load_async"):
             tc.toggle_day_timeline(state)
             self.assertEqual(state.view, "day")
             self.assertTrue(state.day_timeline)
@@ -619,6 +631,106 @@ class TimelineTests(unittest.TestCase):
         self.assertIn("Boardroom", rendered)  # Continuation line
         self.assertIn("4h free", rendered)  # Condensed gap divider
         self.assertIn("V Timeline", rendered)  # Footer key guide
+
+    def test_week_timeline_view(self) -> None:
+        # 2026-10-20 is Tuesday; week window is Mon Oct 19 - Sun Oct 25
+        state = self.make_state(focus_day=date(2026, 10, 20))
+        state.view = "week"
+        state.day_timeline = True
+        state.events = [
+            {
+                "instance_id": "m1",
+                "uid": "m1",
+                "summary": "Monday Kickoff",
+                "start": "2026-10-19T09:00:00-06:00",
+                "end": "2026-10-19T10:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+                "location": "Main Hall",
+            },
+            {
+                "instance_id": "m2",
+                "uid": "m2",
+                "summary": "Monday Afternoon",
+                "start": "2026-10-19T13:00:00-06:00",
+                "end": "2026-10-19T13:30:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+            {
+                "instance_id": "w1",
+                "uid": "w1",
+                "summary": "Wednesday Overlap A",
+                "start": "2026-10-21T10:00:00-06:00",
+                "end": "2026-10-21T11:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+            {
+                "instance_id": "w2",
+                "uid": "w2",
+                "summary": "Wednesday Overlap B",
+                "start": "2026-10-21T10:30:00-06:00",
+                "end": "2026-10-21T11:30:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+        ]
+        tc.rebuild_rows(state)
+
+        headers = [r for r in state.rows if r["kind"] == "header"]
+        self.assertEqual(len(headers), 7)
+        for h_row in headers:
+            self.assertNotIn("timeline", h_row["text"])
+
+        gaps = [r for r in state.rows if r["kind"] == "gap"]
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("3h free", gaps[0]["text"])
+
+        conts = [r for r in state.rows if r["kind"] == "event_cont"]
+        self.assertEqual(len(conts), 3)  # m1 (1h), w1 (1h), w2 (1h) each get 1 continuation row
+        self.assertIn("Main Hall", conts[0]["text"])
+
+        wed_events = [r for r in state.rows if r["kind"] == "event" and r["event"]["uid"] in ("w1", "w2")]
+        self.assertEqual(len(wed_events), 2)
+        self.assertTrue(all(ev["conflict"] for ev in wed_events))
+
+        empties = [r for r in state.rows if r["kind"] == "empty"]
+        self.assertEqual(len(empties), 5)  # 5 days in the week with no events
+
+    def test_week_timeline_render(self) -> None:
+        state = self.make_state(focus_day=date(2026, 10, 20))
+        state.view = "week"
+        state.day_timeline = True
+        state.events = [
+            {
+                "instance_id": "m1",
+                "uid": "m1",
+                "summary": "Monday Kickoff",
+                "start": "2026-10-19T09:00:00-06:00",
+                "end": "2026-10-19T10:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+            {
+                "instance_id": "m2",
+                "uid": "m2",
+                "summary": "Monday Afternoon",
+                "start": "2026-10-19T13:00:00-06:00",
+                "end": "2026-10-19T13:30:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+        ]
+        tc.rebuild_rows(state)
+        scr = FakeScreen([], h=40, w=120)
+        tc.draw(scr, state)
+        rendered = scr.rendered_text()
+
+        self.assertIn("Week of Oct 19 to Oct 25  · timeline", rendered)
+        self.assertIn("Monday Kickoff", rendered)
+        self.assertIn("3h free", rendered)
+        self.assertIn("Monday Afternoon", rendered)
 
 
 class AccountsModalTests(unittest.TestCase):

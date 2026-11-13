@@ -1191,9 +1191,14 @@ def event_dot_x(state: AppState, col_idx: int) -> int:
     return base_x + min(col_idx * 4, 16)
 
 
-def build_day_timeline(state: AppState, rows: list[dict], visible: list[dict]) -> None:
-    """Build visual day timeline: earliest to latest event, condensed gaps, overlap indentation."""
-    day = state.focus_day
+def build_timeline_day(
+    state: AppState,
+    day: date,
+    rows: list[dict],
+    visible: list[dict],
+    show_timeline_tag: bool = True,
+) -> None:
+    """Build visual timeline for a single day: earliest to latest event, condensed gaps, overlaps."""
     todays = [e for e in visible if event_day(e) == day]
     all_day_events = sorted((e for e in todays if e["all_day"]), key=lambda e: e.get("summary") or "")
     timed_events = sorted(
@@ -1201,7 +1206,9 @@ def build_day_timeline(state: AppState, rows: list[dict], visible: list[dict]) -
         key=lambda e: (parse_when(e["start"]), parse_when(e["end"])),
     )
 
-    label = day.strftime("%A, %b %-d") + ("  · today" if day == date.today() else "") + "  · timeline"
+    label = day.strftime("%A, %b %-d") + ("  · today" if day == date.today() else "")
+    if show_timeline_tag:
+        label += "  · timeline"
     rows.append({"kind": "header", "text": label})
 
     for e in all_day_events:
@@ -1313,6 +1320,11 @@ def build_day_timeline(state: AppState, rows: list[dict], visible: list[dict]) -
         placed_now = True
 
 
+def build_day_timeline(state: AppState, rows: list[dict], visible: list[dict]) -> None:
+    """Build visual day timeline: earliest to latest event, condensed gaps, overlap indentation."""
+    build_timeline_day(state, state.focus_day, rows, visible, show_timeline_tag=True)
+
+
 def rebuild_rows(state: AppState) -> None:
     """Flatten events into display rows: day headers, events, and a now marker."""
     rows: list[dict] = []
@@ -1324,8 +1336,18 @@ def rebuild_rows(state: AppState) -> None:
         rows += [{"kind": "event", "event": e, "show_date": True} for e in pending]
         if not pending:
             rows.append({"kind": "empty", "text": "No pending invites"})
-    elif state.view == "day" and state.day_timeline:
-        build_day_timeline(state, rows, visible)
+    elif state.view in ("day", "week") and state.day_timeline:
+        start, end = state.window()
+        day = start
+        while day <= end:
+            build_timeline_day(
+                state,
+                day,
+                rows,
+                visible,
+                show_timeline_tag=(state.view == "day"),
+            )
+            day += timedelta(days=1)
     else:
         start, end = state.window()
         now = datetime.now()
@@ -1822,7 +1844,7 @@ def toggle_calendar(state: AppState, n: int) -> None:
 
 def toggle_day_timeline(state: AppState) -> None:
     was_month = state.view == "month"
-    if state.view != "day":
+    if state.view not in ("day", "week"):
         state.view = "day"
         state.day_timeline = True
     else:
@@ -2411,7 +2433,7 @@ def draw(stdscr, state: AppState) -> None:
     start, end = state.window()
     title = {
         "day": f"{start:%a %b %-d, %Y}" + ("  · timeline" if state.day_timeline else ""),
-        "week": f"Week of {start:%b %-d} to {end:%b %-d}",
+        "week": f"Week of {start:%b %-d} to {end:%b %-d}" + ("  · timeline" if state.day_timeline else ""),
         "month": f"{state.focus_day:%B %Y}",
         "invites": "Invites",
     }[state.view]
