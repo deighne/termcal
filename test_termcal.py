@@ -362,10 +362,22 @@ class TimelineTests(unittest.TestCase):
             self.assertFalse(state.day_timeline)
             mock_save.assert_called_with({"day_timeline": False})
 
-        # When toggling from week view, should switch to day view with timeline enabled
+        # When toggling from week view, should stay in week view and toggle timeline
         state.view = "week"
         state.day_timeline = False
         with patch.object(tc, "save_prefs"):
+            tc.toggle_day_timeline(state)
+            self.assertEqual(state.view, "week")
+            self.assertTrue(state.day_timeline)
+
+            tc.toggle_day_timeline(state)
+            self.assertEqual(state.view, "week")
+            self.assertFalse(state.day_timeline)
+
+        # When toggling from month view, should switch to day view with timeline enabled
+        state.view = "month"
+        state.day_timeline = False
+        with patch.object(tc, "save_prefs"), patch.object(tc, "load_async"):
             tc.toggle_day_timeline(state)
             self.assertEqual(state.view, "day")
             self.assertTrue(state.day_timeline)
@@ -620,6 +632,106 @@ class TimelineTests(unittest.TestCase):
         self.assertIn("4h free", rendered)  # Condensed gap divider
         self.assertIn("V Timeline", rendered)  # Footer key guide
 
+    def test_week_timeline_view(self) -> None:
+        # 2026-10-20 is Tuesday; week window is Mon Oct 19 - Sun Oct 25
+        state = self.make_state(focus_day=date(2026, 10, 20))
+        state.view = "week"
+        state.day_timeline = True
+        state.events = [
+            {
+                "instance_id": "m1",
+                "uid": "m1",
+                "summary": "Monday Kickoff",
+                "start": "2026-10-19T09:00:00-06:00",
+                "end": "2026-10-19T10:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+                "location": "Main Hall",
+            },
+            {
+                "instance_id": "m2",
+                "uid": "m2",
+                "summary": "Monday Afternoon",
+                "start": "2026-10-19T13:00:00-06:00",
+                "end": "2026-10-19T13:30:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+            {
+                "instance_id": "w1",
+                "uid": "w1",
+                "summary": "Wednesday Overlap A",
+                "start": "2026-10-21T10:00:00-06:00",
+                "end": "2026-10-21T11:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+            {
+                "instance_id": "w2",
+                "uid": "w2",
+                "summary": "Wednesday Overlap B",
+                "start": "2026-10-21T10:30:00-06:00",
+                "end": "2026-10-21T11:30:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+        ]
+        tc.rebuild_rows(state)
+
+        headers = [r for r in state.rows if r["kind"] == "header"]
+        self.assertEqual(len(headers), 7)
+        for h_row in headers:
+            self.assertNotIn("timeline", h_row["text"])
+
+        gaps = [r for r in state.rows if r["kind"] == "gap"]
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("3h free", gaps[0]["text"])
+
+        conts = [r for r in state.rows if r["kind"] == "event_cont"]
+        self.assertEqual(len(conts), 3)  # m1 (1h), w1 (1h), w2 (1h) each get 1 continuation row
+        self.assertIn("Main Hall", conts[0]["text"])
+
+        wed_events = [r for r in state.rows if r["kind"] == "event" and r["event"]["uid"] in ("w1", "w2")]
+        self.assertEqual(len(wed_events), 2)
+        self.assertTrue(all(ev["conflict"] for ev in wed_events))
+
+        empties = [r for r in state.rows if r["kind"] == "empty"]
+        self.assertEqual(len(empties), 5)  # 5 days in the week with no events
+
+    def test_week_timeline_render(self) -> None:
+        state = self.make_state(focus_day=date(2026, 10, 20))
+        state.view = "week"
+        state.day_timeline = True
+        state.events = [
+            {
+                "instance_id": "m1",
+                "uid": "m1",
+                "summary": "Monday Kickoff",
+                "start": "2026-10-19T09:00:00-06:00",
+                "end": "2026-10-19T10:00:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+            {
+                "instance_id": "m2",
+                "uid": "m2",
+                "summary": "Monday Afternoon",
+                "start": "2026-10-19T13:00:00-06:00",
+                "end": "2026-10-19T13:30:00-06:00",
+                "all_day": False,
+                "calendar": "work",
+            },
+        ]
+        tc.rebuild_rows(state)
+        scr = FakeScreen([], h=40, w=120)
+        tc.draw(scr, state)
+        rendered = scr.rendered_text()
+
+        self.assertIn("Week of Oct 19 to Oct 25  · timeline", rendered)
+        self.assertIn("Monday Kickoff", rendered)
+        self.assertIn("3h free", rendered)
+        self.assertIn("Monday Afternoon", rendered)
+
 
 class AccountsModalTests(unittest.TestCase):
     def test_get_calendar_info(self) -> None:
@@ -855,6 +967,280 @@ class CliArgTests(unittest.TestCase):
             tc.main(["--check"])
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("✗", err.getvalue())
+
+
+class TargetArgumentTests(unittest.TestCase):
+    def test_parse_target_date_formats(self) -> None:
+        today = date.today()
+        kind, d, path, info = tc.parse_target_argument("2026-12-25")
+        self.assertEqual(kind, "date")
+        self.assertEqual(d, date(2026, 12, 25))
+        self.assertIsNone(path)
+        self.assertIsNone(info)
+
+        kind, d, _, _ = tc.parse_target_argument("today")
+        self.assertEqual(kind, "date")
+        self.assertEqual(d, today)
+
+        kind, d, _, _ = tc.parse_target_argument("tomorrow")
+        self.assertEqual(kind, "date")
+        self.assertEqual(d, today + timedelta(days=1))
+
+    def test_parse_target_calshow(self) -> None:
+        kind, d, _, _ = tc.parse_target_argument("calshow:2026-11-15")
+        self.assertEqual(kind, "date")
+        self.assertEqual(d, date(2026, 11, 15))
+
+        base = date(2026, 5, 1)
+        kind, d, _, _ = tc.parse_target_argument("calshow:", default_day=base)
+        self.assertEqual(kind, "date")
+        self.assertEqual(d, base)
+
+        # Cocoa epoch timestamp test
+        kind, d, _, _ = tc.parse_target_argument("calshow:100000000")
+        self.assertEqual(kind, "date")
+        self.assertIsNotNone(d)
+
+    def test_parse_target_urls(self) -> None:
+        for url in ("webcal://example.com/cal.ics", "ical://example.com/events", "https://example.com"):
+            kind, d, p, _ = tc.parse_target_argument(url)
+            self.assertEqual(kind, "url")
+            self.assertIsNone(d)
+            self.assertIsNone(p)
+
+    def test_parse_target_unknown(self) -> None:
+        kind, d, _, _ = tc.parse_target_argument("gibberish_target_not_a_date")
+        self.assertEqual(kind, "unknown")
+        self.assertIsNone(d)
+
+
+class RawIcsParsingTests(unittest.TestCase):
+    def test_parse_raw_ics_timed_event(self) -> None:
+        ics = (
+            "BEGIN:VCALENDAR\r\n"
+            "BEGIN:VEVENT\r\n"
+            "UID:event-123@example.com\r\n"
+            "SUMMARY:Q4 Planning Session\r\n"
+            "DTSTART:20261105T140000Z\r\n"
+            "DTEND:20261105T150000Z\r\n"
+            "LOCATION:Conference Room B\r\n"
+            "DESCRIPTION:Quarterly review notes\\nAction items\r\n"
+            "ORGANIZER;CN=Alice:mailto:alice@example.com\r\n"
+            "END:VEVENT\r\n"
+            "END:VCALENDAR\r\n"
+        )
+        parsed = tc.parse_raw_ics(ics)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["uid"], "event-123@example.com")
+        self.assertEqual(parsed["summary"], "Q4 Planning Session")
+        self.assertFalse(parsed["all_day"])
+        self.assertEqual(parsed["location"], "Conference Room B")
+        self.assertIn("Quarterly review notes\nAction items", parsed["description"])
+        self.assertIn("mailto:alice@example.com", parsed["organizer"])
+        self.assertEqual(parsed["duration"], timedelta(hours=1))
+
+    def test_parse_raw_ics_all_day_event(self) -> None:
+        ics = (
+            "BEGIN:VCALENDAR\n"
+            "BEGIN:VEVENT\n"
+            "UID:holiday-456\n"
+            "SUMMARY:Christmas Day\n"
+            "DTSTART;VALUE=DATE:20261225\n"
+            "DTEND;VALUE=DATE:20261226\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        parsed = tc.parse_raw_ics(ics)
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed["all_day"])
+        self.assertEqual(parsed["start"], date(2026, 12, 25))
+        self.assertEqual(parsed["duration"], timedelta(days=1))
+
+    def test_parse_raw_ics_duration_property(self) -> None:
+        ics = (
+            "BEGIN:VCALENDAR\n"
+            "BEGIN:VEVENT\n"
+            "UID:standup-789\n"
+            "SUMMARY:Daily Standup\n"
+            "DTSTART:20261105T090000\n"
+            "DURATION:PT45M\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        parsed = tc.parse_raw_ics(ics)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["duration"], timedelta(minutes=45))
+        self.assertEqual(parsed["end"], datetime(2026, 11, 5, 9, 45))
+
+    def test_parse_raw_ics_from_file_and_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "test.ics"
+            f.write_text(
+                "BEGIN:VCALENDAR\n"
+                "BEGIN:VEVENT\n"
+                "SUMMARY:File Test\n"
+                "DTSTART:20261010T100000\n"
+                "END:VEVENT\n"
+                "END:VCALENDAR\n"
+            )
+            parsed = tc.parse_raw_ics(f)
+            self.assertIsNotNone(parsed)
+            self.assertEqual(parsed["summary"], "File Test")
+
+            non_existent = Path(td) / "non_existent.ics"
+            self.assertIsNone(tc.parse_raw_ics(non_existent))
+
+            empty_file = Path(td) / "empty.ics"
+            empty_file.write_text("")
+            self.assertIsNone(tc.parse_raw_ics(empty_file))
+
+
+class MacAppBundleTests(unittest.TestCase):
+    def test_generate_app_icon_icns(self) -> None:
+        data = tc.generate_app_icon_icns()
+        self.assertTrue(data.startswith(b"icns"))
+        self.assertGreater(len(data), 300)
+        self.assertIn(b"ic07", data)
+        self.assertIn(b"\x89PNG", data)
+
+    def test_install_and_uninstall_macos_app(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = Path(td) / "Applications" / "TermCal.app"
+
+            with patch("subprocess.run") as mock_subproc:
+                mock_subproc.return_value.returncode = 0
+                ok, msg = tc.install_macos_app(app_dir)
+                self.assertTrue(ok)
+                self.assertIn("Installed TermCal.app", msg)
+                self.assertTrue((app_dir / "Contents" / "Info.plist").is_file())
+                self.assertTrue((app_dir / "Contents" / "PkgInfo").is_file())
+                launcher = app_dir / "Contents" / "MacOS" / "termcal-launcher"
+                self.assertTrue(launcher.is_file())
+                self.assertTrue(launcher.stat().st_mode & 0o111)  # executable
+                self.assertTrue((app_dir / "Contents" / "Resources" / "AppIcon.icns").is_file())
+
+                # Test uninstall
+                ok, u_msg = tc.uninstall_macos_app(app_dir)
+                self.assertTrue(ok)
+                self.assertIn("Removed", u_msg)
+                self.assertFalse(app_dir.exists())
+
+                # Uninstall again (already uninstalled)
+                ok, u_msg2 = tc.uninstall_macos_app(app_dir)
+                self.assertTrue(ok)
+                self.assertIn("already uninstalled", u_msg2)
+
+
+class ImportEventModalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.td = tempfile.TemporaryDirectory()
+        self.cal_dir = Path(self.td.name) / "caldir"
+        self.cal_dir.mkdir()
+        (self.cal_dir / "personal").mkdir()
+        self.state = tc.AppState()
+        self.state.calendar_dir = self.cal_dir
+        self.state.calendars = [{"slug": "personal", "name": "Personal", "read_only": False}]
+        self.state.default_calendar = "personal"
+
+    def tearDown(self) -> None:
+        self.td.cleanup()
+
+    def test_dispatch_import_event_and_submit(self) -> None:
+        ext_file = Path(self.td.name) / "invite.ics"
+        ext_file.write_text(
+            "BEGIN:VCALENDAR\n"
+            "BEGIN:VEVENT\n"
+            "UID:import-test-1\n"
+            "SUMMARY:External Conference\n"
+            "DTSTART:20261120T100000\n"
+            "DTEND:20261120T110000\n"
+            "LOCATION:Austin, TX\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        info = tc.parse_raw_ics(ext_file)
+        self.assertIsNotNone(info)
+
+        tc.dispatch_import_event(self.state, ext_file, info)
+        self.assertIsNotNone(self.state.modal)
+        self.assertEqual(self.state.modal["title"], "Import Event")
+        values = {f["key"]: f["value"] for f in self.state.modal["fields"]}
+        self.assertEqual(values["title"], "External Conference")
+        self.assertEqual(values["calendar"], "personal")
+
+        # Submit modal
+        values["title"] = "Renamed Conference"
+        err = self.state.modal["on_submit"](values)
+        self.assertIsNone(err)
+
+        # Worker processes background job
+        label, work_fn = self.state.jobs.get_nowait()
+        self.assertEqual(label, "import")
+        with patch.object(tc, "after_write") as mock_after_write:
+            work_fn()
+            mock_after_write.assert_called_once()
+
+        # Check imported file exists in personal calendar
+        imported = self.cal_dir / "personal" / "invite.ics"
+        self.assertTrue(imported.is_file())
+        self.assertIn("SUMMARY:Renamed Conference", imported.read_text())
+
+    def test_handle_target_launch_internal_vs_external(self) -> None:
+        # Internal file
+        internal_file = self.cal_dir / "personal" / "event1.ics"
+        internal_file.write_text(
+            "BEGIN:VCALENDAR\n"
+            "BEGIN:VEVENT\n"
+            "UID:internal-1\n"
+            "DTSTART:20261201T090000\n"
+            "SUMMARY:Internal\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        res_int = tc.handle_target_launch(self.state, str(internal_file))
+        self.assertIsNotNone(res_int)
+        self.assertEqual(res_int.get("internal_uid"), "internal-1")
+        self.assertEqual(self.state.focus_day, date(2026, 12, 1))
+
+        # External file
+        ext_file = Path(self.td.name) / "outside.ics"
+        ext_file.write_text(
+            "BEGIN:VCALENDAR\n"
+            "BEGIN:VEVENT\n"
+            "UID:external-2\n"
+            "DTSTART:20261215T150000\n"
+            "SUMMARY:Outside\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        res_ext = tc.handle_target_launch(self.state, str(ext_file))
+        self.assertIsNotNone(res_ext)
+        self.assertTrue(res_ext.get("external_ics"))
+        self.assertEqual(self.state.focus_day, date(2026, 12, 15))
+
+
+class CliAppMainTests(unittest.TestCase):
+    @patch.object(tc, "install_macos_app", return_value=(True, "Installed TermCal.app OK"))
+    def test_cli_install_app_flag(self, mock_install) -> None:
+        with self.assertRaises(SystemExit) as ctx, patch("sys.stdout", new_callable=io.StringIO) as out:
+            tc.main(["--install-app"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("Installed TermCal.app OK", out.getvalue())
+        mock_install.assert_called_once()
+
+    @patch.object(tc, "uninstall_macos_app", return_value=(True, "Removed TermCal.app OK"))
+    def test_cli_uninstall_app_flag(self, mock_uninstall) -> None:
+        with self.assertRaises(SystemExit) as ctx, patch("sys.stdout", new_callable=io.StringIO) as out:
+            tc.main(["--uninstall-app"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("Removed TermCal.app OK", out.getvalue())
+        mock_uninstall.assert_called_once()
+
+    @patch.object(tc, "check_caldir", return_value=(True, "caldir OK"))
+    @patch("curses.wrapper")
+    def test_cli_target_passed_to_wrapper(self, mock_wrapper, _mock_check) -> None:
+        tc.main(["2026-12-25"])
+        mock_wrapper.assert_called_once_with(tc.tui, "2026-12-25")
 
 
 if __name__ == "__main__":

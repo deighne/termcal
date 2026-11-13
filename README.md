@@ -88,7 +88,7 @@ termcal --check
 | `[` `]` | Previous / next week (or previous / next month in month view) |
 | `t` | Jump to today |
 | `w` | Toggle day / week view |
-| `v` | Toggle visual timeline in day view (proportional blocks, condensed free time, overlap conflicts) |
+| `v` | Toggle visual timeline in day and week views (proportional blocks, condensed free time, overlap conflicts) |
 | `c` | Toggle full calendar month view (`Enter` opens the focused day) |
 | `i` | Toggle pending invites view |
 | `Enter` / `o` | Open meeting link (Zoom, Google Meet, Teams, Webex) |
@@ -125,6 +125,42 @@ termcal --check
 Press `u` to toggle auto-sync; your preference is saved in `~/.config/termcal/state.json`.
 
 While auto-sync is enabled, TermCal runs a full `caldir sync` at startup, and a windowed sync (2 weeks back through 2 months ahead) every 5 minutes and immediately after any RSVP, new event, edit, or delete. Pressing `s` runs a full sync on demand. Syncing runs in the background and never blocks navigation or key input.
+
+## macOS Default Calendar & CLI Targets
+
+TermCal can be opened with specific targets or registered as your system-wide default calendar on macOS.
+
+### CLI Target Arguments
+
+```bash
+# Open focused on a specific date
+termcal 2026-12-25
+termcal tomorrow
+
+# Open an external .ics invite (prompts to import into a connected calendar)
+termcal ~/Downloads/invite.ics
+
+# Open from a calshow: URI
+termcal calshow:2026-11-15
+```
+
+### Setting as Default macOS Calendar
+
+To install the lightweight `~/Applications/TermCal.app` runner and register with LaunchServices:
+
+```bash
+termcal --install-app
+```
+
+Then select TermCal as your default calendar:
+1. Open **Calendar.app** $\rightarrow$ **Settings** (`Cmd-,`)
+2. Set **Default calendar app** to **TermCal**
+
+To remove the application bundle and unregister:
+
+```bash
+termcal --uninstall-app
+```
 
 ## Development
 
