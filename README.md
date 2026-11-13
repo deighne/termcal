@@ -88,7 +88,7 @@ termcal --check
 | `[` `]` | Previous / next week (or previous / next month in month view) |
 | `t` | Jump to today |
 | `w` | Toggle day / week view |
-| `v` | Toggle visual timeline in day view (proportional blocks, condensed free time, overlap conflicts) |
+| `v` | Toggle visual timeline in day and week views (proportional blocks, condensed free time, overlap conflicts) |
 | `c` | Toggle full calendar month view (`Enter` opens the focused day) |
 | `i` | Toggle pending invites view |
 | `Enter` / `o` | Open meeting link (Zoom, Google Meet, Teams, Webex) |
