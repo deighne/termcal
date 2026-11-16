@@ -2174,6 +2174,23 @@ def cal_attr(state: AppState, slug: str) -> int:
     return 0
 
 
+def now_attr() -> int:
+    try:
+        return curses.color_pair(1) if curses.has_colors() else 0
+    except curses.error:
+        return 0
+
+
+def _event_timing(e: dict, status: str | None) -> tuple[bool, bool]:
+    """Return (is_past, is_in_progress) for an event relative to current local time."""
+    if e["all_day"]:
+        return False, False
+    now = datetime.now()
+    start = parse_when(e["start"])
+    end = parse_when(e["end"])
+    return end < now, status != "declined" and start <= now < end
+
+
 def draw_event_row(stdscr, state: AppState, y: int, row: dict, selected: bool, width: int) -> None:
     e = row["event"]
     if e["all_day"]:
@@ -2186,11 +2203,18 @@ def draw_event_row(stdscr, state: AppState, y: int, row: dict, selected: bool, w
     status = my_status(e, state.my_emails)
     glyph = RSVP_GLYPH.get(status or "", " ")
     link = " ⧉" if meeting_url(e) else ""
-    past = not e["all_day"] and parse_when(e["end"]) < datetime.now()
+    past, in_progress = _event_timing(e, status)
 
     base = curses.A_REVERSE if selected else (curses.A_DIM if past or status == "declined" else 0)
+    live_attr = base if selected else (base | now_attr() | curses.A_BOLD)
+    time_attr = live_attr if in_progress else base
     addstr(stdscr, y, 0, " " * width, base)
-    addstr(stdscr, y, 1, "▸" if selected else " ", base)
+    if selected:
+        addstr(stdscr, y, 1, "▸", base)
+    elif in_progress:
+        addstr(stdscr, y, 1, "│", live_attr)
+    else:
+        addstr(stdscr, y, 1, " ", base)
 
     if row.get("timeline") and not e["all_day"]:
         col_idx = row.get("col", 0)
@@ -2198,7 +2222,7 @@ def draw_event_row(stdscr, state: AppState, y: int, row: dict, selected: bool, w
         dur_min = row.get("dur_min", 0)
         dot_x = event_dot_x(state, col_idx)
 
-        addstr(stdscr, y, 3, when, base)
+        addstr(stdscr, y, 3, when, time_attr)
         if col_idx > 0:
             addstr(stdscr, y, dot_x - 4, "  ↳ ", base | (curses.A_DIM if not selected else 0))
         addstr(stdscr, y, dot_x, "●", base | cal_attr(state, e["calendar"]))
@@ -2206,28 +2230,30 @@ def draw_event_row(stdscr, state: AppState, y: int, row: dict, selected: bool, w
         dur_badge = fmt_duration_badge(dur_min)
         conflict_badge = " ⚡" if conflict else ""
         title_attr = base if past else base | curses.A_BOLD
-        addstr(
-            stdscr,
-            y,
-            dot_x + 4,
-            f"{e['summary'] or '(no title)'}{dur_badge}{conflict_badge}{link}",
-            title_attr,
-        )
+        body = f"{e['summary'] or '(no title)'}{dur_badge}{conflict_badge}{link}"
+        addstr(stdscr, y, dot_x + 4, body, title_attr)
+        if in_progress:
+            addstr(stdscr, y, dot_x + 4 + len(body), "  · now", live_attr)
     else:
         col = 3 + (25 if row.get("show_date") else 14)
-        addstr(stdscr, y, 3, when, base)
+        addstr(stdscr, y, 3, when, time_attr)
         addstr(stdscr, y, col, "●", base | cal_attr(state, e["calendar"]))
         addstr(stdscr, y, col + 2, glyph, base)
         title_attr = base if past else base | curses.A_BOLD
-        addstr(stdscr, y, col + 4, f"{e['summary'] or '(no title)'}{link}", title_attr)
+        body = f"{e['summary'] or '(no title)'}{link}"
+        addstr(stdscr, y, col + 4, body, title_attr)
+        if in_progress:
+            addstr(stdscr, y, col + 4 + len(body), "  · now", live_attr)
 
 
 def draw_event_cont_row(stdscr, state: AppState, y: int, row: dict, selected: bool, width: int) -> None:
     e = row["event"]
     status = my_status(e, state.my_emails)
-    past = not e["all_day"] and parse_when(e["end"]) < datetime.now()
+    past, in_progress = _event_timing(e, status)
     base = curses.A_REVERSE if selected else (curses.A_DIM if past or status == "declined" else 0)
     addstr(stdscr, y, 0, " " * width, base)
+    if in_progress and not selected:
+        addstr(stdscr, y, 1, "│", now_attr() | curses.A_BOLD)
 
     col_idx = row.get("col", 0)
     dot_x = event_dot_x(state, col_idx)
@@ -2504,7 +2530,7 @@ def draw(stdscr, state: AppState) -> None:
             if kind == "header":
                 addstr(stdscr, y, 1, row["text"], curses.A_BOLD | curses.A_UNDERLINE)
             elif kind == "now":
-                addstr(stdscr, y, 3, f"── now {row['text']} " + "─" * (w - 20), curses.color_pair(1))
+                addstr(stdscr, y, 3, f"── now {row['text']} " + "─" * (w - 20), now_attr())
             elif kind == "empty":
                 addstr(stdscr, y, 3, row["text"], curses.A_DIM)
             elif kind == "gap":
