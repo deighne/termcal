@@ -822,6 +822,84 @@ class TimelineTests(unittest.TestCase):
         self.assertIn("3h free", rendered)
         self.assertIn("Monday Afternoon", rendered)
 
+    def test_in_progress_indicator_normal_and_timeline(self) -> None:
+        now = datetime.now().astimezone()
+        live_start = (now - timedelta(minutes=15)).isoformat()
+        live_end = (now + timedelta(minutes=45)).isoformat()
+        past_start = (now - timedelta(hours=3)).isoformat()
+        past_end = (now - timedelta(hours=2)).isoformat()
+
+        state = self.make_state(focus_day=now.date())
+        state.my_emails = ["me@example.com"]
+        state.events = [
+            {
+                "instance_id": "past1",
+                "uid": "past1",
+                "summary": "Earlier Call",
+                "start": past_start,
+                "end": past_end,
+                "all_day": False,
+                "calendar": "work",
+            },
+            {
+                "instance_id": "live1",
+                "uid": "live1",
+                "summary": "Live Standup",
+                "start": live_start,
+                "end": live_end,
+                "all_day": False,
+                "calendar": "work",
+                "location": "Room 4",
+            },
+            {
+                "instance_id": "declined1",
+                "uid": "declined1",
+                "summary": "Declined Overlap",
+                "start": live_start,
+                "end": live_end,
+                "all_day": False,
+                "calendar": "work",
+                "attendees": [{"email": "me@example.com", "status": "declined"}],
+            },
+        ]
+
+        # 1. Normal day view (keep Earlier Call selected so Live Standup is unselected)
+        state.day_timeline = False
+        tc.rebuild_rows(state)
+        state.cursor = 1
+        scr = FakeScreen([], h=30, w=120)
+        tc.draw(scr, state)
+        rendered = scr.rendered_text()
+
+        live_lines = [line for line in rendered.splitlines() if "Live Standup" in line]
+        self.assertEqual(len(live_lines), 1)
+        self.assertIn("· now", live_lines[0])
+        self.assertIn("│", live_lines[0])
+
+        past_lines = [line for line in rendered.splitlines() if "Earlier Call" in line]
+        self.assertGreaterEqual(len(past_lines), 1)
+        self.assertNotIn("· now", past_lines[0])
+
+        declined_lines = [line for line in rendered.splitlines() if "Declined Overlap" in line]
+        self.assertEqual(len(declined_lines), 1)
+        self.assertNotIn("· now", declined_lines[0])
+
+        # 2. Timeline view (including continuation row gutter bar)
+        state.day_timeline = True
+        tc.rebuild_rows(state)
+        state.cursor = 1
+        scr_tl = FakeScreen([], h=30, w=120)
+        tc.draw(scr_tl, state)
+        rendered_tl = scr_tl.rendered_text()
+
+        tl_lines = rendered_tl.splitlines()
+        live_idx = next(i for i, line in enumerate(tl_lines) if "Live Standup" in line)
+        self.assertIn("· now", tl_lines[live_idx])
+        self.assertIn("│", tl_lines[live_idx])
+        # Continuation row immediately below should also carry the left gutter bar
+        self.assertIn("Room 4", tl_lines[live_idx + 1])
+        self.assertTrue(tl_lines[live_idx + 1].lstrip().startswith("│"))
+
 
 class AccountsModalTests(unittest.TestCase):
     def test_get_calendar_info(self) -> None:
