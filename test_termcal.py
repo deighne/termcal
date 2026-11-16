@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import curses
 import io
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -283,6 +285,94 @@ class IcsAndPathTests(unittest.TestCase):
             self.assertIn("DTSTART;TZID=America/Chicago:20261001T094500", master_text)
             self.assertIn("DTEND;TZID=America/Chicago:20261001T100000", master_text)
             self.assertIn("RRULE:FREQ=DAILY", master_text)
+
+    def test_update_ics_event_converts_timezone(self) -> None:
+        old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Chicago"
+        time.tzset()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                # 1. Event in America/New_York edited from America/Chicago
+                master = Path(tmp) / "_recurring__checkin.ics"
+                master.write_text(
+                    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:CALDIR\r\n"
+                    "BEGIN:VEVENT\r\nUID:checkin-1@caldir\r\nSUMMARY:Client Strategy Check-In\r\n"
+                    "DTSTART;TZID=America/New_York:20261026T103000\r\n"
+                    "DTEND;TZID=America/New_York:20261026T110000\r\n"
+                    "RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+                )
+                ev = {
+                    "uid": "checkin-1@caldir",
+                    "summary": "Client Strategy Check-In",
+                    "start": "2026-11-16T09:30:00-06:00",
+                    "end": "2026-11-16T10:00:00-06:00",
+                    "all_day": False,
+                    "recurring": True,
+                    "recurrence_id": "TZID=America/New_York:20261116T103000",
+                    "tzid": "America/New_York",
+                }
+                override = tc.update_ics_event(
+                    master,
+                    ev,
+                    title="Client Strategy Check-In",
+                    day=date(2026, 11, 16),
+                    start_dt=datetime(2026, 11, 16, 9, 45),
+                    duration=timedelta(minutes=15),
+                    location="",
+                    description="",
+                    scope="instance",
+                )
+                override_text = override.read_text()
+                # 09:45 CST == 10:45 EST
+                self.assertIn("DTSTART;TZID=America/New_York:20261116T104500", override_text)
+                self.assertIn("DTEND;TZID=America/New_York:20261116T110000", override_text)
+
+                # 2. Series edit preserves anchor date while converting time to America/New_York
+                tc.update_ics_event(
+                    master,
+                    ev,
+                    title="Client Strategy Check-In",
+                    day=date(2026, 11, 16),
+                    start_dt=datetime(2026, 11, 16, 9, 45),
+                    duration=timedelta(minutes=15),
+                    location="",
+                    description="",
+                    scope="series",
+                )
+                master_text = master.read_text()
+                self.assertIn("DTSTART;TZID=America/New_York:20261026T104500", master_text)
+                self.assertIn("DTEND;TZID=America/New_York:20261026T110000", master_text)
+
+                # 3. Event with UTC (Z) timestamps
+                utc_ics = Path(tmp) / "2026-11-16T0930__utc-sync.ics"
+                utc_ics.write_text(
+                    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:CALDIR\r\n"
+                    "BEGIN:VEVENT\r\nUID:utc-1@caldir\r\nSUMMARY:UTC Sync\r\n"
+                    "DTSTART:20261116T153000Z\r\n"
+                    "DTEND:20261116T160000Z\r\n"
+                    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+                )
+                tc.update_ics_event(
+                    utc_ics,
+                    {"uid": "utc-1@caldir", "all_day": False},
+                    title="UTC Sync",
+                    day=date(2026, 11, 16),
+                    start_dt=datetime(2026, 11, 16, 9, 45),
+                    duration=timedelta(minutes=30),
+                    location="",
+                    description="",
+                    scope="single",
+                )
+                utc_text = utc_ics.read_text()
+                # 09:45 CST (-06:00) == 15:45 UTC
+                self.assertIn("DTSTART:20261116T154500Z", utc_text)
+                self.assertIn("DTEND:20261116T161500Z", utc_text)
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
 
 
 class CaldirCheckTests(unittest.TestCase):
