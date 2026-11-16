@@ -27,6 +27,7 @@ import webbrowser
 import zlib
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 __version__ = "0.1.0"
 MIN_CALDIR_VERSION = (0, 14, 0)
@@ -402,6 +403,46 @@ def ics_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
 
 
+def _format_ics_dt_pair(
+    start_dt: datetime,
+    duration: timedelta,
+    tzid: str | None,
+    is_utc: bool,
+    anchor_date: date | None = None,
+) -> tuple[str, str]:
+    """Convert naive local start_dt to the target ICS timezone and format DTSTART/DTEND."""
+    if tzid:
+        try:
+            target_tz = ZoneInfo(tzid)
+            conv_start = start_dt.astimezone().astimezone(target_tz).replace(tzinfo=None)
+            if anchor_date is not None:
+                conv_start = datetime.combine(anchor_date, conv_start.time())
+            conv_end = conv_start + duration
+            return (
+                f"DTSTART;TZID={tzid}:{conv_start:%Y%m%dT%H%M%S}",
+                f"DTEND;TZID={tzid}:{conv_end:%Y%m%dT%H%M%S}",
+            )
+        except (ZoneInfoNotFoundError, KeyError, ValueError):
+            pass
+
+    if is_utc:
+        conv_start = start_dt.astimezone().astimezone(UTC).replace(tzinfo=None)
+        if anchor_date is not None:
+            conv_start = datetime.combine(anchor_date, conv_start.time())
+        conv_end = conv_start + duration
+        return (
+            f"DTSTART:{conv_start:%Y%m%dT%H%M%SZ}",
+            f"DTEND:{conv_end:%Y%m%dT%H%M%SZ}",
+        )
+
+    conv_start = datetime.combine(anchor_date, start_dt.time()) if anchor_date is not None else start_dt
+    conv_end = conv_start + duration
+    return (
+        f"DTSTART:{conv_start:%Y%m%dT%H%M%S}",
+        f"DTEND:{conv_end:%Y%m%dT%H%M%S}",
+    )
+
+
 def update_ics_event(
     path: Path,
     event: dict,
@@ -427,19 +468,14 @@ def update_ics_event(
             if m:
                 tzid = m.group(1)
                 break
+    is_utc = any(line.startswith("DTSTART:") and line.rstrip().endswith("Z") for line in lines)
 
     if start_dt is None:
         end_day = day + max(timedelta(days=1), duration)
         dtstart_line = f"DTSTART;VALUE=DATE:{day:%Y%m%d}"
         dtend_line = f"DTEND;VALUE=DATE:{end_day:%Y%m%d}"
     else:
-        end_dt = start_dt + duration
-        if tzid:
-            dtstart_line = f"DTSTART;TZID={tzid}:{start_dt:%Y%m%dT%H%M%S}"
-            dtend_line = f"DTEND;TZID={tzid}:{end_dt:%Y%m%dT%H%M%S}"
-        else:
-            dtstart_line = f"DTSTART:{start_dt:%Y%m%dT%H%M%S}"
-            dtend_line = f"DTEND:{end_dt:%Y%m%dT%H%M%S}"
+        dtstart_line, dtend_line = _format_ics_dt_pair(start_dt, duration, tzid, is_utc)
 
     now_stamp = f"DTSTAMP:{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
     rid = event.get("recurrence_id")
@@ -503,14 +539,9 @@ def update_ics_event(
                 val = line.split(":", 1)[1].strip()
                 if len(val) >= 8 and val[:8].isdigit():
                     orig_date = date(int(val[:4]), int(val[4:6]), int(val[6:8]))
-                    adj_start = datetime.combine(orig_date, start_dt.time())
-                    adj_end = adj_start + duration
-                    if tzid:
-                        dtstart_line = f"DTSTART;TZID={tzid}:{adj_start:%Y%m%dT%H%M%S}"
-                        dtend_line = f"DTEND;TZID={tzid}:{adj_end:%Y%m%dT%H%M%S}"
-                    else:
-                        dtstart_line = f"DTSTART:{adj_start:%Y%m%dT%H%M%S}"
-                        dtend_line = f"DTEND:{adj_end:%Y%m%dT%H%M%S}"
+                    dtstart_line, dtend_line = _format_ics_dt_pair(
+                        start_dt, duration, tzid, is_utc, anchor_date=orig_date
+                    )
                 break
 
     new_lines: list[str] = []
