@@ -2439,7 +2439,7 @@ def handle_normal_input(state: AppState, key: int) -> bool:
                 state, "Accept Recurring Event", ev, lambda sc: dispatch_rsvp(state, "accept", sc)
             )
         else:
-            dispatch_accounts(state)
+            dispatch_rsvp(state, "accept", "instance")
     elif key in (10, 13, curses.KEY_ENTER) or k == "o":
         if state.view == "month" and key in (10, 13, curses.KEY_ENTER):
             state.view = "day"

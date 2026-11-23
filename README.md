@@ -102,7 +102,7 @@ termcal --check
 | `u` | Toggle auto-sync (remembered between runs) |
 | `r` | Reload from the local store |
 | `1`-`9` | Toggle calendar visibility |
-| `,` / `A` | Connected accounts & calendars modal (view providers, accounts, paths, set default, toggle visibility) |
+| `,` | Connected accounts & calendars modal (view providers, accounts, paths, set default, toggle visibility) |
 | `q` | Quit |
 
 ## How it maps to caldir
