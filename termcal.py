@@ -570,6 +570,201 @@ def update_ics_event(
     return path
 
 
+def _parse_rid_local(rid_str: str | None) -> datetime | None:
+    """Parse an ICS RECURRENCE-ID value (with optional params) into naive local datetime."""
+    if not rid_str:
+        return None
+    val = rid_str.split(":")[-1].strip()
+    if len(val) == 8 and val.isdigit():
+        return datetime(int(val[:4]), int(val[4:6]), int(val[6:8]))
+    if len(val) >= 15 and val[:8].isdigit() and val[8] == "T" and val[9:15].isdigit():
+        dt = datetime(
+            int(val[:4]),
+            int(val[4:6]),
+            int(val[6:8]),
+            int(val[9:11]),
+            int(val[11:13]),
+            int(val[13:15]),
+        )
+        if val.endswith("Z"):
+            return dt.replace(tzinfo=UTC).astimezone().replace(tzinfo=None)
+        m = re.search(r"TZID=([^;:]+)", rid_str)
+        if m:
+            try:
+                return dt.replace(tzinfo=ZoneInfo(m.group(1))).astimezone().replace(tzinfo=None)
+            except (ZoneInfoNotFoundError, KeyError, ValueError):
+                pass
+        return dt
+    return None
+
+
+def _occurrence_rid(event: dict, master_lines: list[str] | None = None) -> str | None:
+    """Return the RECURRENCE-ID string (e.g. 'TZID=...:20261123T090000') for an occurrence."""
+    rid = event.get("recurrence_id")
+    if rid:
+        return rid
+    start = event.get("start")
+    if not start:
+        return None
+    if event.get("all_day"):
+        return f"VALUE=DATE:{start[:10].replace('-', '')}"
+    dt = parse_when(start)
+    tzid = event.get("tzid")
+    if not tzid and master_lines:
+        for line in master_lines:
+            m = re.match(r"^DTSTART;[^:]*TZID=([^;:]+)", line)
+            if m:
+                tzid = m.group(1)
+                break
+    if tzid:
+        try:
+            conv = dt.astimezone().astimezone(ZoneInfo(tzid)).replace(tzinfo=None)
+            return f"TZID={tzid}:{conv:%Y%m%dT%H%M%S}"
+        except (ZoneInfoNotFoundError, KeyError, ValueError):
+            pass
+    utc_dt = dt.astimezone().astimezone(UTC).replace(tzinfo=None)
+    return f"{utc_dt:%Y%m%dT%H%M%SZ}"
+
+
+def _add_exdate_to_ics(master_path: Path, rid: str) -> None:
+    """Insert an EXDATE for `rid` into a recurring master .ics file."""
+    raw = master_path.read_text(errors="replace")
+    crlf = "\r\n" if "\r\n" in raw else "\n"
+    unfolded = re.sub(r"\r?\n[ \t]", "", raw)
+    lines = unfolded.splitlines()
+    rid_core = rid.split(":")[-1].strip()
+    for line in lines:
+        if line.upper().startswith("EXDATE") and rid_core in line:
+            return
+
+    exdate_line = f"EXDATE;{rid}" if "=" in rid else f"EXDATE:{rid}"
+    now_stamp = f"DTSTAMP:{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+    new_lines: list[str] = []
+    in_vevent = False
+    for line in lines:
+        if line == "BEGIN:VEVENT":
+            in_vevent = True
+            new_lines.append(line)
+            continue
+        if line == "END:VEVENT" and in_vevent:
+            in_vevent = False
+            new_lines.extend([now_stamp, exdate_line, line])
+            continue
+        if in_vevent and line.split(":", 1)[0].split(";", 1)[0].upper() == "DTSTAMP":
+            continue
+        new_lines.append(line)
+    master_path.write_text(crlf.join(new_lines) + crlf)
+
+
+def _truncate_rrule_until(master_path: Path, cutoff_local: datetime, all_day: bool) -> bool:
+    """Truncate master's RRULE with UNTIL before `cutoff_local`. Returns False if master starts >= cutoff."""
+    raw = master_path.read_text(errors="replace")
+    crlf = "\r\n" if "\r\n" in raw else "\n"
+    unfolded = re.sub(r"\r?\n[ \t]", "", raw)
+    lines = unfolded.splitlines()
+
+    for line in lines:
+        if line.startswith("DTSTART"):
+            head, tail = line.split(":", 1)
+            raw_part = tail.strip() if ";" not in head else line.split(";", 1)[1]
+            master_start = _parse_rid_local(raw_part)
+            if master_start is not None and master_start >= cutoff_local:
+                return False
+            break
+
+    if all_day:
+        until_val = (cutoff_local.date() - timedelta(days=1)).strftime("%Y%m%d")
+    else:
+        until_utc = (cutoff_local.astimezone().astimezone(UTC) - timedelta(seconds=1)).replace(tzinfo=None)
+        until_val = f"{until_utc:%Y%m%dT%H%M%SZ}"
+
+    now_stamp = f"DTSTAMP:{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+    new_lines: list[str] = []
+    in_vevent = False
+    for line in lines:
+        if line == "BEGIN:VEVENT":
+            in_vevent = True
+            new_lines.append(line)
+            continue
+        if line == "END:VEVENT" and in_vevent:
+            in_vevent = False
+            new_lines.extend([now_stamp, line])
+            continue
+        if in_vevent:
+            prop = line.split(":", 1)[0].split(";", 1)[0].upper()
+            if prop == "DTSTAMP":
+                continue
+            if prop == "RRULE":
+                parts = [
+                    p
+                    for p in line.split(":", 1)[1].split(";")
+                    if p and not p.upper().startswith(("UNTIL=", "COUNT="))
+                ]
+                parts.append(f"UNTIL={until_val}")
+                new_lines.append("RRULE:" + ";".join(parts))
+                continue
+        new_lines.append(line)
+    master_path.write_text(crlf.join(new_lines) + crlf)
+    return True
+
+
+def delete_ics_event(
+    path: Path,
+    event: dict,
+    uid_entries: list[tuple[Path, str | None]],
+    scope: str = "instance",
+) -> None:
+    """Delete a single event or a recurring occurrence/future/series from local .ics storage."""
+    if not event.get("recurring"):
+        path.unlink(missing_ok=True)
+        return
+
+    master_path = next((p for p, rid in uid_entries if rid is None), None)
+    if master_path is None and path.name.startswith("_recurring__"):
+        master_path = path
+
+    if scope == "all":
+        path.unlink(missing_ok=True)
+        for p, _ in uid_entries:
+            p.unlink(missing_ok=True)
+        return
+
+    if scope == "future":
+        cutoff = parse_when(event["start"])
+        if master_path and master_path.exists():
+            kept = _truncate_rrule_until(master_path, cutoff, bool(event.get("all_day")))
+            if not kept:
+                master_path.unlink(missing_ok=True)
+                for p, _ in uid_entries:
+                    p.unlink(missing_ok=True)
+                return
+        for p, file_rid in uid_entries:
+            if file_rid is None:
+                continue
+            rid_dt = _parse_rid_local(file_rid)
+            if rid_dt is not None and rid_dt >= cutoff:
+                p.unlink(missing_ok=True)
+        if not path.name.startswith("_recurring__") and path.exists():
+            path.unlink(missing_ok=True)
+        return
+
+    # scope == "instance"
+    if master_path and master_path.exists():
+        master_lines = master_path.read_text(errors="replace").splitlines()
+        rid = _occurrence_rid(event, master_lines)
+        if rid:
+            _add_exdate_to_ics(master_path, rid)
+    if not path.name.startswith("_recurring__"):
+        path.unlink(missing_ok=True)
+    else:
+        rid = _occurrence_rid(event)
+        if rid:
+            rid_core = rid.split(":")[-1]
+            for p, file_rid in uid_entries:
+                if file_rid and file_rid.endswith(rid_core):
+                    p.unlink(missing_ok=True)
+
+
 def ics_unescape(value: str) -> str:
     """Reverse RFC 5545 string escaping."""
     return (
@@ -1463,7 +1658,75 @@ def calendar_writable(state: AppState, slug: str) -> bool:
     return not any(c["slug"] == slug and c.get("read_only") for c in state.calendars)
 
 
-def dispatch_rsvp(state: AppState, response: str) -> None:
+def _rsvp_target_paths(
+    state: AppState,
+    path: Path,
+    event: dict,
+    scope: str,
+) -> list[Path]:
+    """Return the .ics file paths to update for an RSVP with the given scope."""
+    if not event.get("recurring"):
+        return [path]
+
+    uid_entries = state.path_index.get(event["uid"], [])
+    master_path = next((p for p, rid in uid_entries if rid is None), None)
+    if master_path is None and path.name.startswith("_recurring__"):
+        master_path = path
+
+    if scope == "instance":
+        if not path.name.startswith("_recurring__"):
+            return [path]
+        master_lines = master_path.read_text(errors="replace").splitlines() if master_path else None
+        rid = _occurrence_rid(event, master_lines)
+        if not rid:
+            return [path]
+        ev_copy = {**event, "recurrence_id": rid}
+        all_day = bool(event.get("all_day"))
+        day = event_day(event)
+        start_dt = None if all_day else parse_when(event["start"])
+        if all_day:
+            dur = max(timedelta(days=1), date.fromisoformat(event["end"][:10]) - day)
+        else:
+            dur = parse_when(event["end"]) - start_dt
+        override_path = update_ics_event(
+            path,
+            ev_copy,
+            title=event.get("summary") or "",
+            day=day,
+            start_dt=start_dt,
+            duration=dur,
+            location=event.get("location") or "",
+            description=event.get("description") or "",
+            scope="instance",
+        )
+        return [override_path]
+
+    if scope == "future":
+        cutoff = parse_when(event["start"])
+        targets: list[Path] = []
+        if master_path and master_path.exists():
+            targets.append(master_path)
+        for p, file_rid in uid_entries:
+            if file_rid is None or not p.exists():
+                continue
+            rid_dt = _parse_rid_local(file_rid)
+            if rid_dt is not None and rid_dt >= cutoff and p not in targets:
+                targets.append(p)
+        if not targets:
+            targets.append(path)
+        return targets
+
+    # scope == "all"
+    targets = []
+    if master_path and master_path.exists():
+        targets.append(master_path)
+    for p, _ in uid_entries:
+        if p.exists() and p not in targets:
+            targets.append(p)
+    return targets or [path]
+
+
+def dispatch_rsvp(state: AppState, response: str, scope: str = "instance") -> None:
     event = state.selected()
     if not event:
         return
@@ -1473,12 +1736,35 @@ def dispatch_rsvp(state: AppState, response: str) -> None:
         return
 
     def work():
-        result = caldir("rsvp", str(path), response, "--timeout", SYNC_TIMEOUT, timeout=120)
-        msg = (result.stdout or result.stderr).strip().splitlines()
-        log_append(state, f"rsvp {response}: {msg[-1] if msg else 'done'}")
+        targets = _rsvp_target_paths(state, path, event, scope)
+        last_msg = "done"
+        for target in targets:
+            result = caldir("rsvp", str(target), response, "--timeout", SYNC_TIMEOUT, timeout=120)
+            lines = (result.stdout or result.stderr).strip().splitlines()
+            if lines:
+                last_msg = lines[-1]
+        scope_tag = f" ({scope})" if event.get("recurring") else ""
+        log_append(state, f"rsvp {response}{scope_tag}: {last_msg}")
         after_write(state)
 
     run_bg(state, f"rsvp {response}", work)
+
+
+def dispatch_scope_modal(state: AppState, title: str, event: dict, on_select) -> None:
+    """Open a modal to choose 'instance', 'future', or 'all' for recurring RSVP/delete."""
+    options = [
+        ("instance", "Just this instance"),
+        ("future", "This and future instances"),
+        ("all", "All instances (past and future)"),
+    ]
+    state.modal = {
+        "type": "scope",
+        "title": title,
+        "summary": event.get("summary") or "(no title)",
+        "options": options,
+        "index": 0,
+        "on_select": on_select,
+    }
 
 
 def dispatch_open(state: AppState) -> None:
@@ -1621,12 +1907,9 @@ def dispatch_edit(state: AppState) -> None:
     }
 
 
-def dispatch_delete(state: AppState) -> None:
+def dispatch_delete(state: AppState, scope: str = "instance") -> None:
     event = state.selected()
     if not event:
-        return
-    if event.get("recurring"):
-        log_append(state, "deleting recurring events isn't supported yet")
         return
     if not calendar_writable(state, event["calendar"]):
         log_append(state, "calendar is read-only")
@@ -1635,20 +1918,29 @@ def dispatch_delete(state: AppState) -> None:
     if not path:
         log_append(state, "can't find .ics for this event")
         return
+    uid_entries = list(state.path_index.get(event["uid"], []))
+
+    def run_delete():
+        def work():
+            delete_ics_event(path, event, uid_entries, scope=scope)
+            scope_tag = f" ({scope})" if event.get("recurring") else ""
+            log_append(state, f"deleted {event['summary']}{scope_tag}")
+            after_write(state)
+
+        run_bg(state, "delete", work)
+
+    if event.get("recurring") and scope in ("future", "all"):
+        run_delete()
+        return
 
     def confirmed(answer: str):
         if answer.strip().lower() != "y":
             log_append(state, "delete cancelled")
             return
+        run_delete()
 
-        def work():
-            path.unlink()
-            log_append(state, f"deleted {event['summary']}")
-            after_write(state)
-
-        run_bg(state, "delete", work)
-
-    start_prompt(state, f"Delete '{event['summary']}'? (y/N)", confirmed)
+    label = "this instance of " if event.get("recurring") else ""
+    start_prompt(state, f"Delete {label}'{event['summary']}'? (y/N)", confirmed)
 
 
 def dispatch_new(state: AppState) -> None:
@@ -2023,12 +2315,40 @@ def handle_accounts_modal_input(state: AppState, key: int) -> None:
     state.dirty = True
 
 
+def handle_scope_modal_input(state: AppState, key: int) -> None:
+    m = state.modal
+    if not m:
+        return
+    options = m["options"]
+    k = chr(key) if 0 <= key < 256 else ""
+    if key == 27 or k in ("q", "Q"):
+        state.modal = None
+    elif key == curses.KEY_UP or k == "k":
+        m["index"] = (m["index"] - 1) % len(options)
+    elif key == curses.KEY_DOWN or k == "j":
+        m["index"] = (m["index"] + 1) % len(options)
+    elif key in (10, 13, curses.KEY_ENTER):
+        scope = options[m["index"]][0]
+        state.modal = None
+        m["on_select"](scope)
+    elif k in ("1", "2", "3"):
+        idx = int(k) - 1
+        if 0 <= idx < len(options):
+            scope = options[idx][0]
+            state.modal = None
+            m["on_select"](scope)
+    state.dirty = True
+
+
 def handle_modal_input(state: AppState, key: int) -> None:
     m = state.modal
     if not m:
         return
     if m.get("type") == "accounts":
         handle_accounts_modal_input(state, key)
+        return
+    if m.get("type") == "scope":
+        handle_scope_modal_input(state, key)
         return
     fields = m["fields"]
     f = fields[m["index"]]
@@ -2110,8 +2430,16 @@ def handle_normal_input(state: AppState, key: int) -> bool:
             rebuild_rows(state)
     elif k == "v":
         toggle_day_timeline(state)
-    elif k in ("A", ","):
+    elif k == ",":
         dispatch_accounts(state)
+    elif k == "A":
+        ev = state.selected()
+        if ev and ev.get("recurring"):
+            dispatch_scope_modal(
+                state, "Accept Recurring Event", ev, lambda sc: dispatch_rsvp(state, "accept", sc)
+            )
+        else:
+            dispatch_accounts(state)
     elif key in (10, 13, curses.KEY_ENTER) or k == "o":
         if state.view == "month" and key in (10, 13, curses.KEY_ENTER):
             state.view = "day"
@@ -2121,17 +2449,39 @@ def handle_normal_input(state: AppState, key: int) -> bool:
     elif k == "g":
         dispatch_google(state)
     elif k == "a":
-        dispatch_rsvp(state, "accept")
+        dispatch_rsvp(state, "accept", "instance")
     elif k == "d":
-        dispatch_rsvp(state, "decline")
+        dispatch_rsvp(state, "decline", "instance")
+    elif k == "D":
+        ev = state.selected()
+        if ev and ev.get("recurring"):
+            dispatch_scope_modal(
+                state, "Decline Recurring Event", ev, lambda sc: dispatch_rsvp(state, "decline", sc)
+            )
+        else:
+            dispatch_rsvp(state, "decline", "instance")
     elif k == "m":
-        dispatch_rsvp(state, "maybe")
+        dispatch_rsvp(state, "maybe", "instance")
+    elif k == "M":
+        ev = state.selected()
+        if ev and ev.get("recurring"):
+            dispatch_scope_modal(
+                state, "Maybe Recurring Event", ev, lambda sc: dispatch_rsvp(state, "maybe", sc)
+            )
+        else:
+            dispatch_rsvp(state, "maybe", "instance")
     elif k == "n":
         dispatch_new(state)
     elif k == "e":
         dispatch_edit(state)
     elif k == "x":
-        dispatch_delete(state)
+        dispatch_delete(state, "instance")
+    elif k == "X":
+        ev = state.selected()
+        if ev and ev.get("recurring"):
+            dispatch_scope_modal(state, "Delete Recurring Event", ev, lambda sc: dispatch_delete(state, sc))
+        else:
+            dispatch_delete(state, "instance")
     elif k == "s":
         queue_sync(state, full=True)
     elif k == "u":
@@ -2151,8 +2501,8 @@ def handle_normal_input(state: AppState, key: int) -> bool:
 # ---------------------------------------------------------------------------
 
 FOOTER = [
-    "←→ Day | [ ] Wk | T Today | W Week | C Month | I Invites | V Timeline | A Accounts | 1-9 Cals | Q Quit",
-    "O Join | G Google | A Accept | D Decline | M Maybe | N New | E Edit | X Delete | S Sync | U Auto-sync",
+    "←→ Day | [ ] Wk | T Today | W Week | C Month | I Invites | V Timeline | , Accounts | 1-9 Cals | Q Quit",
+    "O Join | G Google | A/D/M RSVP | Shift+A/D/M/X Scope | N New | E Edit | X Del | S Sync | U Auto-sync",
 ]
 
 
@@ -2426,6 +2776,39 @@ def draw_accounts_modal(stdscr, state: AppState, h: int, w: int) -> None:
     addstr(stdscr, footer_y + 1, left + 2, hint2[: box_w - 4], curses.A_DIM)
 
 
+def draw_scope_modal(stdscr, state: AppState, h: int, w: int) -> None:
+    m = state.modal
+    if not m:
+        return
+    options = m["options"]
+    box_w = min(max(48, w - 12), 62)
+    box_h = len(options) + 7
+    top = max(1, (h - box_h) // 2)
+    left = max(2, (w - box_w) // 2)
+
+    for r in range(box_h):
+        addstr(stdscr, top + r, left, " " * box_w, 0)
+    addstr(stdscr, top, left, "┌" + "─" * (box_w - 2) + "┐", curses.A_BOLD)
+    for r in range(1, box_h - 1):
+        addstr(stdscr, top + r, left, "│", curses.A_BOLD)
+        addstr(stdscr, top + r, left + box_w - 1, "│", curses.A_BOLD)
+    addstr(stdscr, top + box_h - 1, left, "└" + "─" * (box_w - 2) + "┘", curses.A_BOLD)
+
+    addstr(stdscr, top, left + 2, f" {m['title']} ", curses.A_BOLD | curses.A_REVERSE)
+    addstr(stdscr, top + 2, left + 3, m["summary"][: box_w - 6], curses.A_DIM)
+
+    for i, (_scope_key, label) in enumerate(options):
+        y = top + 4 + i
+        selected = i == m["index"]
+        marker = "▸" if selected else " "
+        attr = (curses.A_REVERSE | curses.A_BOLD) if selected else 0
+        line = f" {marker} {i + 1}. {label}".ljust(box_w - 4)
+        addstr(stdscr, y, left + 2, line[: box_w - 4], attr)
+
+    hint = "↑↓/1-3 choose · Enter confirm · Esc cancel"
+    addstr(stdscr, top + box_h - 2, left + 2, hint[: box_w - 4], curses.A_DIM)
+
+
 def draw_modal(stdscr, state: AppState, h: int, w: int) -> None:
     m = state.modal
     if not m:
@@ -2577,6 +2960,8 @@ def draw(stdscr, state: AppState) -> None:
     if state.modal:
         if state.modal.get("type") == "accounts":
             draw_accounts_modal(stdscr, state, h, w)
+        elif state.modal.get("type") == "scope":
+            draw_scope_modal(stdscr, state, h, w)
         else:
             draw_modal(stdscr, state, h, w)
 
