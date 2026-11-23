@@ -547,9 +547,13 @@ class RecurringRsvpAndDeleteTests(unittest.TestCase):
             tc.handle_modal_input(state, 27)
             self.assertIsNone(state.modal)
 
-            # Shift+A on non-recurring event still opens Accounts modal
+            # ',' opens Accounts modal; Shift+A on non-recurring event accepts directly
             ev["recurring"] = False
-            tc.handle_normal_input(state, ord("A"))
+            with patch.object(tc, "dispatch_rsvp") as mock_rsvp:
+                tc.handle_normal_input(state, ord("A"))
+                mock_rsvp.assert_called_once_with(state, "accept", "instance")
+
+            tc.handle_normal_input(state, ord(","))
             self.assertEqual(state.modal["type"], "accounts")
 
 
