@@ -93,15 +93,16 @@ termcal --check
 | `i` | Toggle pending invites view |
 | `Enter` / `o` | Open meeting link (Zoom, Google Meet, Teams, Webex) |
 | `g` | Open event in external calendar (Google Calendar web, Outlook web, or default desktop calendar) |
-| `a` `d` `m` | RSVP accept / decline / maybe (`caldir rsvp`) |
+| `a` `d` `m` | RSVP accept / decline / maybe (`caldir rsvp`; defaults to just this instance on recurring events) |
+| `A` `D` `M` | RSVP recurring event with scope modal (just this instance, this and future, or all instances) |
 | `n` | New event modal: title, when, duration, location, notes, calendar |
 | `e` | Edit event modal: title, when, duration, location, notes (this event vs. entire series) |
-| `x` | Delete event (prompts for confirmation) |
+| `x` / `X` | Delete event (`x` = just this instance; `X` = scope modal on recurring events) |
 | `s` | Full sync now (push + pull across caldir's full range) |
 | `u` | Toggle auto-sync (remembered between runs) |
 | `r` | Reload from the local store |
 | `1`-`9` | Toggle calendar visibility |
-| `A` / `,` | Connected accounts & calendars modal (view providers, accounts, paths, set default, toggle visibility) |
+| `,` / `A` | Connected accounts & calendars modal (view providers, accounts, paths, set default, toggle visibility) |
 | `q` | Quit |
 
 ## How it maps to caldir

@@ -375,6 +375,184 @@ class IcsAndPathTests(unittest.TestCase):
             time.tzset()
 
 
+class RecurringRsvpAndDeleteTests(unittest.TestCase):
+    def _make_series(self, tmp: str) -> tuple[tc.AppState, Path, Path, Path, dict]:
+        cal_dir = Path(tmp) / "work"
+        cal_dir.mkdir(parents=True)
+        master = cal_dir / "_recurring__sync.ics"
+        master.write_text(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:CALDIR\r\n"
+            "BEGIN:VEVENT\r\nUID:sync-1@caldir\r\nSUMMARY:Weekly Sync\r\n"
+            "DTSTART;TZID=America/Chicago:20261102T090000\r\n"
+            "DTEND;TZID=America/Chicago:20261102T093000\r\n"
+            "RRULE:FREQ=WEEKLY;BYDAY=MO\r\n"
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@example.com\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+        past_ov = cal_dir / "2026-11-09T0900__sync.ics"
+        past_ov.write_text(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:CALDIR\r\n"
+            "BEGIN:VEVENT\r\nUID:sync-1@caldir\r\nSUMMARY:Weekly Sync\r\n"
+            "RECURRENCE-ID;TZID=America/Chicago:20261109T090000\r\n"
+            "DTSTART;TZID=America/Chicago:20261109T090000\r\n"
+            "DTEND;TZID=America/Chicago:20261109T093000\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+        future_ov = cal_dir / "2026-11-30T1000__sync.ics"
+        future_ov.write_text(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:CALDIR\r\n"
+            "BEGIN:VEVENT\r\nUID:sync-1@caldir\r\nSUMMARY:Weekly Sync\r\n"
+            "RECURRENCE-ID;TZID=America/Chicago:20261130T090000\r\n"
+            "DTSTART;TZID=America/Chicago:20261130T100000\r\n"
+            "DTEND;TZID=America/Chicago:20261130T103000\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+        with patch.object(tc, "read_config", return_value={}):
+            state = tc.AppState()
+        state.calendar_dir = Path(tmp)
+        state.calendars = [{"slug": "work", "name": "Work", "color": "#0000ff", "read_only": False}]
+        state.path_index = {
+            "sync-1@caldir": [
+                (master, None),
+                (past_ov, "TZID=America/Chicago:20261109T090000"),
+                (future_ov, "TZID=America/Chicago:20261130T090000"),
+            ]
+        }
+        ev = {
+            "instance_id": "sync-1@caldir#20261123",
+            "uid": "sync-1@caldir",
+            "summary": "Weekly Sync",
+            "start": "2026-11-23T09:00:00-06:00",
+            "end": "2026-11-23T09:30:00-06:00",
+            "all_day": False,
+            "recurring": True,
+            "recurrence_id": "TZID=America/Chicago:20261123T090000",
+            "tzid": "America/Chicago",
+            "calendar": "work",
+        }
+        state.rows = [{"kind": "event", "event": ev}]
+        state.cursor = 0
+        return state, master, past_ov, future_ov, ev
+
+    def test_rsvp_target_paths_for_all_scopes(self) -> None:
+        old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Chicago"
+        time.tzset()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                state, master, past_ov, future_ov, ev = self._make_series(tmp)
+
+                # instance -> creates standalone override .ics, leaves master untouched
+                inst_paths = tc._rsvp_target_paths(state, master, ev, "instance")
+                self.assertEqual(len(inst_paths), 1)
+                self.assertNotEqual(inst_paths[0], master)
+                self.assertTrue(inst_paths[0].exists())
+                self.assertIn("RECURRENCE-ID;TZID=America/Chicago:20261123T090000", inst_paths[0].read_text())
+
+                # future -> master + future_ov, excluding past_ov
+                future_paths = tc._rsvp_target_paths(state, master, ev, "future")
+                self.assertEqual(set(future_paths), {master, future_ov})
+
+                # all -> master + all overrides
+                all_paths = tc._rsvp_target_paths(state, master, ev, "all")
+                self.assertEqual(set(all_paths), {master, past_ov, future_ov})
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
+
+    def test_delete_ics_event_instance_future_and_all(self) -> None:
+        old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Chicago"
+        time.tzset()
+        try:
+            # 1. instance: adds EXDATE to master
+            with tempfile.TemporaryDirectory() as tmp:
+                state, master, past_ov, future_ov, ev = self._make_series(tmp)
+                tc.delete_ics_event(master, ev, state.path_index[ev["uid"]], scope="instance")
+                self.assertTrue(master.exists())
+                self.assertIn("EXDATE;TZID=America/Chicago:20261123T090000", master.read_text())
+                self.assertTrue(past_ov.exists())
+                self.assertTrue(future_ov.exists())
+
+            # 2. future: truncates RRULE UNTIL and deletes future override, preserves past override
+            with tempfile.TemporaryDirectory() as tmp:
+                state, master, past_ov, future_ov, ev = self._make_series(tmp)
+                tc.delete_ics_event(master, ev, state.path_index[ev["uid"]], scope="future")
+                self.assertTrue(master.exists())
+                # 2026-11-23 09:00 CST (-06:00) -> 15:00:00Z, minus 1s -> 14:59:59Z
+                self.assertIn("RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261123T145959Z", master.read_text())
+                self.assertTrue(past_ov.exists())
+                self.assertFalse(future_ov.exists())
+
+            # 3. all: removes master and all overrides
+            with tempfile.TemporaryDirectory() as tmp:
+                state, master, past_ov, future_ov, ev = self._make_series(tmp)
+                tc.delete_ics_event(master, ev, state.path_index[ev["uid"]], scope="all")
+                self.assertFalse(master.exists())
+                self.assertFalse(past_ov.exists())
+                self.assertFalse(future_ov.exists())
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
+
+    def test_keybindings_and_scope_modal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state, _master, _past_ov, _future_ov, ev = self._make_series(tmp)
+
+            # Lowercase d/m/a dispatch directly with scope='instance'
+            with patch.object(tc, "dispatch_rsvp") as mock_rsvp:
+                tc.handle_normal_input(state, ord("d"))
+                mock_rsvp.assert_called_with(state, "decline", "instance")
+                tc.handle_normal_input(state, ord("m"))
+                mock_rsvp.assert_called_with(state, "maybe", "instance")
+                tc.handle_normal_input(state, ord("a"))
+                mock_rsvp.assert_called_with(state, "accept", "instance")
+
+            # Shift+D opens scope modal, renders options, and '2' selects 'future'
+            tc.handle_normal_input(state, ord("D"))
+            self.assertIsNotNone(state.modal)
+            self.assertEqual(state.modal["type"], "scope")
+            self.assertEqual(state.modal["title"], "Decline Recurring Event")
+
+            scr = FakeScreen([], h=30, w=100)
+            tc.draw(scr, state)
+            rendered = scr.rendered_text()
+            self.assertIn("Just this instance", rendered)
+            self.assertIn("This and future instances", rendered)
+            self.assertIn("All instances (past and future)", rendered)
+
+            with patch.object(tc, "dispatch_rsvp") as mock_rsvp:
+                tc.handle_modal_input(state, ord("2"))
+                self.assertIsNone(state.modal)
+                mock_rsvp.assert_called_once_with(state, "decline", "future")
+
+            # Shift+A on recurring opens Accept scope modal; arrow down + Enter picks 'future'
+            tc.handle_normal_input(state, ord("A"))
+            self.assertEqual(state.modal["title"], "Accept Recurring Event")
+            tc.handle_modal_input(state, curses.KEY_DOWN)
+            tc.handle_modal_input(state, curses.KEY_DOWN)
+            with patch.object(tc, "dispatch_rsvp") as mock_rsvp:
+                tc.handle_modal_input(state, 10)
+                mock_rsvp.assert_called_once_with(state, "accept", "all")
+
+            # Shift+X opens Delete scope modal; Esc cancels
+            tc.handle_normal_input(state, ord("X"))
+            self.assertEqual(state.modal["title"], "Delete Recurring Event")
+            tc.handle_modal_input(state, 27)
+            self.assertIsNone(state.modal)
+
+            # Shift+A on non-recurring event still opens Accounts modal
+            ev["recurring"] = False
+            tc.handle_normal_input(state, ord("A"))
+            self.assertEqual(state.modal["type"], "accounts")
+
+
 class CaldirCheckTests(unittest.TestCase):
     def test_parse_caldir_version(self) -> None:
         self.assertEqual(tc.parse_caldir_version("caldir-cli 0.14.9"), (0, 14, 9))
